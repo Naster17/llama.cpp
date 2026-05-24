@@ -14,8 +14,16 @@
 #include <map>
 #include <stdexcept>
 #include <unordered_map>
+#include <vector>
 
-using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
+struct llama_buf_range {
+    uint32_t idx;
+    size_t first;
+    size_t last;
+    ggml_backend_buffer_t buf;
+};
+
+using llama_buf_map = std::vector<llama_buf_range>;
 
 // lists of buffer types used for each layer
 using buft_list_t = std::vector<std::pair<ggml_backend_dev_t, ggml_backend_buffer_type_t>>;

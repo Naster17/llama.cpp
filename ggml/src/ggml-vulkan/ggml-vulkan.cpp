@@ -16554,15 +16554,22 @@ static ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_ba
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     auto device = ggml_vk_get_device(ctx->device);
 
-    vk_buffer buf = ggml_vk_buffer_from_host_ptr(device, ptr, size);
+    const size_t alignment = device->min_imported_host_pointer_alignment;
+    const uintptr_t uptr = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t base = uptr & ~(uintptr_t) (alignment - 1);
+    const size_t offset = uptr - base;
+    const size_t import_size = (offset + size + alignment - 1) & ~(alignment - 1);
+    void * import_ptr = reinterpret_cast<void *>(base);
+
+    vk_buffer buf = ggml_vk_buffer_from_host_ptr(device, import_ptr, import_size);
 
     if (!buf) {
         return {};
     }
 
-    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(device, std::move(buf), device->name, ptr);
+    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(device, std::move(buf), device->name, import_ptr);
 
-    ggml_backend_buffer_t ret = ggml_backend_buffer_init(ggml_backend_vk_device_get_buffer_type(dev), ggml_backend_vk_buffer_interface, bufctx, size);
+    ggml_backend_buffer_t ret = ggml_backend_buffer_init(ggml_backend_vk_device_get_buffer_type(dev), ggml_backend_vk_buffer_interface, bufctx, import_size);
 
     return ret;
 }
