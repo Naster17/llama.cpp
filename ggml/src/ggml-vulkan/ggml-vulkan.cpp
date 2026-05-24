@@ -16524,9 +16524,13 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
         return {};
     }
 
-    const vk::MemoryPropertyFlags property_flags = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached;
-
     vk_buffer buf {};
+
+    const vk::MemoryPropertyFlags property_flags[] = {
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+        vk::MemoryPropertyFlagBits::eHostVisible,
+    };
 
     const vk::ExternalMemoryHandleTypeFlagBits handle_types[] = {
         vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT,
@@ -16534,13 +16538,15 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
     };
 
     for (const auto handle_type : handle_types) {
-        try {
-            buf = ggml_vk_create_buffer(device, size, { property_flags }, ptr, handle_type);
-        } catch (vk::SystemError& e) {
-            GGML_LOG_WARN("ggml_vulkan: Failed ggml_vk_create_buffer (%s)\n", e.what());
-        }
-        if (buf) {
-            break;
+        for (const auto flags : property_flags) {
+            try {
+                buf = ggml_vk_create_buffer(device, size, { flags }, ptr, handle_type);
+            } catch (vk::SystemError& e) {
+                GGML_LOG_WARN("ggml_vulkan: Failed ggml_vk_create_buffer (%s)\n", e.what());
+            }
+            if (buf) {
+                return buf;
+            }
         }
     }
 
