@@ -280,6 +280,34 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
     }
 }
 
+static ggml_backend_dev_t get_moe_gpu_device(const common_params & params) {
+    ggml_backend_load_all();
+
+    for (auto * dev : params.devices) {
+        if (dev != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+            return dev;
+        }
+    }
+
+    if (auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU)) {
+        return dev;
+    }
+    if (auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)) {
+        return dev;
+    }
+
+    throw std::invalid_argument("no usable GPU device found for --gpu-moe");
+}
+
+static llama_model_tensor_buft_override llm_ffn_exps_gpu_override(const common_params & params) {
+    auto * dev = get_moe_gpu_device(params);
+    auto * buft = ggml_backend_dev_buffer_type(dev);
+    if (!buft) {
+        throw std::invalid_argument(string_format("device %s has no default buffer type", ggml_backend_dev_name(dev)));
+    }
+    return { LLM_FFN_EXPS_REGEX, buft };
+}
+
 static std::string clean_file_name(const std::string & fname) {
     std::string clean_fname = fname;
     string_replace_all(clean_fname, "\\", "_");
@@ -2333,6 +2361,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CPU_MOE"));
     add_opt(common_arg(
+        {"-gmoe", "--gpu-moe"},
+        "keep all Mixture of Experts (MoE) weights in the first GPU device buffer\n"
+        "on UMA/APU Vulkan with mmap this can use GPU access to mapped host memory",
+        [](common_params & params) {
+            params.tensor_buft_overrides.push_back(llm_ffn_exps_gpu_override(params));
+        }
+    ).set_env("LLAMA_ARG_GPU_MOE"));
+    add_opt(common_arg(
         {"-ncmoe", "--n-cpu-moe"}, "N",
         "keep the Mixture of Experts (MoE) weights of the first N layers in the CPU",
         [](common_params & params, int value) {
@@ -2347,6 +2383,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"-ngmoe", "--n-gpu-moe"}, "N",
+        "keep the Mixture of Experts (MoE) weights of the first N layers in the first GPU device buffer",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            auto * dev = get_moe_gpu_device(params);
+            auto * buft = ggml_backend_dev_buffer_type(dev);
+            if (!buft) {
+                throw std::invalid_argument(string_format("device %s has no default buffer type", ggml_backend_dev_name(dev)));
+            }
+            for (int i = 0; i < value; ++i) {
+                // keep strings alive and avoid leaking memory by storing them in a static vector
+                static std::list<std::string> buft_overrides;
+                buft_overrides.push_back(llm_ffn_exps_block_regex(i));
+                params.tensor_buft_overrides.push_back({buft_overrides.back().c_str(), buft});
+            }
+        }
+    ).set_env("LLAMA_ARG_N_GPU_MOE"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
