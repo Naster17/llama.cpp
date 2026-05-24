@@ -16570,7 +16570,13 @@ static ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_ba
     vk_buffer buf = ggml_vk_buffer_from_host_ptr(device, import_ptr, import_size);
 
     if (!buf) {
-        return {};
+        try {
+            buf = ggml_vk_create_buffer_device(device, import_size);
+            ggml_vk_buffer_write(buf, 0, import_ptr, import_size);
+        } catch (vk::SystemError& e) {
+            GGML_LOG_WARN("ggml_vulkan: Failed fallback buffer_from_host_ptr copy (%s)\n", e.what());
+            return {};
+        }
     }
 
     ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(device, std::move(buf), device->name, import_ptr);
