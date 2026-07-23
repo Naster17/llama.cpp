@@ -3191,6 +3191,28 @@ static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDe
     return indices;
 }
 
+static bool ggml_vk_physical_device_is_uma(const vk::PhysicalDevice & physical_device, const vk::PhysicalDeviceProperties & properties) {
+    if (properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu) {
+        return true;
+    }
+
+    if (properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
+        return false;
+    }
+
+    vk::PhysicalDeviceMemoryProperties mem_props = physical_device.getMemoryProperties();
+    for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
+        const vk::MemoryPropertyFlags flags = mem_props.memoryTypes[i].propertyFlags;
+        const bool device_local = bool(flags & vk::MemoryPropertyFlagBits::eDeviceLocal);
+        const bool host_visible = bool(flags & vk::MemoryPropertyFlagBits::eHostVisible);
+        if (device_local && host_visible) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std::initializer_list<vk::MemoryPropertyFlags> & req_flags_list,
                                        void *import_ptr = nullptr) {
     VK_LOG_DEBUG("ggml_vk_create_buffer(" << device->name << ", " << size << ", " << to_string(req_flags_list.begin()[0]) << ", " << to_string(req_flags_list.begin()[req_flags_list.size()-1]) << ")");
@@ -6134,7 +6156,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
 
         device->subgroup_size = subgroup_props.subgroupSize;
         device->subgroup_size_log2 = uint32_t(log2f(float(device->subgroup_size)));
-        device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
+        device->uma = ggml_vk_physical_device_is_uma(device->physical_device, device->properties);
         if (sm_builtins) {
             device->shader_core_count = sm_props.shaderSMCount;
         } else if (amd_shader_core_properties2) {
@@ -6173,8 +6195,8 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->subgroup_vote = (vk11_props.subgroupSupportedStages & vk::ShaderStageFlagBits::eCompute) &&
                                 (vk11_props.subgroupSupportedOperations & vk::SubgroupFeatureFlagBits::eVote);
 
-        // Submit at least every 100 nodes, in case there are workloads without as much matmul.
-        device->max_nodes_per_submit = 100;
+        // UMA devices benefit from larger batches because transfer overlap is less useful there.
+        device->max_nodes_per_submit = device->uma ? 300 : 100;
         const char* GGML_VK_MAX_NODES_PER_SUBMIT = getenv("GGML_VK_MAX_NODES_PER_SUBMIT");
         if (GGML_VK_MAX_NODES_PER_SUBMIT != nullptr) {
             uint32_t max_nodes_per_submit = std::stoul(GGML_VK_MAX_NODES_PER_SUBMIT);
@@ -8122,6 +8144,33 @@ static void ggml_vk_buffer_write_nc_async(ggml_backend_vk_context * ctx, vk_cont
 
 static bool ggml_vk_buffer_write_2d_async(vk_context subctx, vk_buffer& dst, size_t offset, const void * src, size_t spitch, size_t dpitch, size_t width, size_t height, bool sync_staging = false) {
     VK_LOG_DEBUG("ggml_vk_buffer_write_2d_async(" << width << ", " << height << ")");
+    if (dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
+        GGML_ASSERT(dst->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
+
+        if (width == spitch && width == dpitch) {
+            deferred_memcpy((uint8_t *)dst->ptr + offset, src, width * height, &subctx->in_memcpys);
+        } else {
+            for (size_t i = 0; i < height; i++) {
+                deferred_memcpy((uint8_t *)dst->ptr + offset + i * dpitch, (const uint8_t *) src + i * spitch, width, &subctx->in_memcpys);
+            }
+        }
+
+        const bool transfer_queue = subctx->p->q->transfer_only;
+        const vk::AccessFlags dst_access = transfer_queue ?
+            (vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) :
+            (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite);
+        subctx->s->buffer->buf.pipelineBarrier(
+            vk::PipelineStageFlagBits::eHost,
+            subctx->p->q->stage_flags,
+            {},
+            { { vk::AccessFlagBits::eHostWrite, dst_access } },
+            {},
+            {}
+        );
+
+        return true;
+    }
+
     // Check if src is pinned memory
     vk_buffer buf = nullptr;
     size_t buf_offset = 0;
@@ -8242,6 +8291,33 @@ static bool ggml_vk_buffer_read_2d_async(vk_context subctx, vk_buffer& src, size
     GGML_ASSERT(src != nullptr);
 
     // TODO: staging_offset is not used
+
+    if ((src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) && src->device->uma) {
+        GGML_ASSERT(src->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
+
+        const bool transfer_queue = subctx->p->q->transfer_only;
+        const vk::AccessFlags src_access = transfer_queue ?
+            vk::AccessFlagBits::eTransferWrite :
+            (vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite);
+        subctx->s->buffer->buf.pipelineBarrier(
+            subctx->p->q->stage_flags,
+            vk::PipelineStageFlagBits::eHost,
+            {},
+            { { src_access, vk::AccessFlagBits::eHostRead } },
+            {},
+            {}
+        );
+
+        if (width == spitch && width == dpitch) {
+            deferred_memcpy(dst, (const uint8_t *) src->ptr + offset, width * height, &subctx->out_memcpys);
+        } else {
+            for (size_t i = 0; i < height; i++) {
+                deferred_memcpy((uint8_t *) dst + i * dpitch, (const uint8_t *) src->ptr + offset + i * spitch, width, &subctx->out_memcpys);
+            }
+        }
+
+        return true;
+    }
 
     // Check if dst is pinned memory
     vk_buffer buf = nullptr;
@@ -18218,7 +18294,8 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
         static std::mutex mutex;
         std::lock_guard<std::mutex> lock(mutex);
         if (!initialized) {
-            const int min_batch_size = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
+            const char * min_batch_size_env = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
+            const int min_batch_size = min_batch_size_env ? atoi(min_batch_size_env) : 32;
             for (int i = 0; i < ggml_backend_vk_get_device_count(); i++) {
                 ggml_backend_vk_device_context * ctx = new ggml_backend_vk_device_context;
                 char desc[256];
@@ -18228,7 +18305,7 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
                 ctx->description = desc;
                 ctx->is_integrated_gpu = ggml_backend_vk_get_device_type(i) == vk::PhysicalDeviceType::eIntegratedGpu;
                 ctx->pci_bus_id = ggml_backend_vk_get_device_pci_id(i);
-                ctx->op_offload_min_batch_size = min_batch_size;
+                ctx->op_offload_min_batch_size = min_batch_size_env ? min_batch_size : (ctx->is_integrated_gpu ? 8 : min_batch_size);
                 devices.push_back(new ggml_backend_device {
                     /* .iface   = */ ggml_backend_vk_device_i,
                     /* .reg     = */ reg,
