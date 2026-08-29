@@ -1626,6 +1626,9 @@ private:
                     continue;
                 }
 
+                SLT_INF(slot, "LRU candidate: t_last=%" PRId64 " cached=%d checkpoints=%zu responses=%d\n",
+                        slot.t_last_used, slot.prompt.n_tokens(), slot.prompt.checkpoints.size(), slot.prompt.n_responses);
+
                 // select the current slot if the criteria match
                 if (!ret || slot.t_last_used <= t_last) {
                     t_last = slot.t_last_used;
@@ -2372,6 +2375,54 @@ private:
                     i++, checkpoint.n_tokens, checkpoint.size() / (1024.0 * 1024.0),
                     checkpoint.pos_min, checkpoint.pos_max, (unsigned int) checkpoint_hash(slot, checkpoint),
                     (unsigned int) checkpoint.n_hits, age_s, hit);
+        }
+
+        size_t n_slots_idle = 0;
+        size_t n_slots_busy = 0;
+        size_t n_tokens_live = 0;
+        size_t n_checkpoints = 0;
+        size_t n_checkpoints_response = 0;
+        size_t size_checkpoints = 0;
+        const server_slot * slot_lru = nullptr;
+
+        for (const auto & cur : slots) {
+            if (cur.is_processing()) {
+                n_slots_busy++;
+            } else {
+                n_slots_idle++;
+                if (slot_lru == nullptr || cur.t_last_used < slot_lru->t_last_used) {
+                    slot_lru = &cur;
+                }
+            }
+
+            n_tokens_live += cur.prompt.n_tokens();
+            for (const auto & checkpoint : cur.prompt.checkpoints) {
+                n_checkpoints++;
+                n_checkpoints_response += checkpoint.is_response;
+                size_checkpoints += checkpoint.size();
+            }
+        }
+
+        const double lru_age_s = slot_lru && slot_lru->t_last_used > 0 ? (t_now - slot_lru->t_last_used) / 1e6 : 0.0;
+        const int n_checkpoints_max = (int) slots.size() * params_base.n_ctx_checkpoints;
+        const std::string lru_oldest = slot_lru
+            ? string_format("id=%d age=%.0fs", slot_lru->id, lru_age_s)
+            : "none";
+        SLT_INF(slot, "CACHE METRICS | slots idle=%zu busy=%zu lru=%zu oldest=%s | live=%zu tok | checkpoints=%zu/%d response=%zu %.1f MiB\n",
+                n_slots_idle, n_slots_busy, n_slots_idle,
+                lru_oldest.c_str(),
+                n_tokens_live, n_checkpoints, n_checkpoints_max, n_checkpoints_response, size_checkpoints / (1024.0 * 1024.0));
+
+        if (prompt_cache) {
+            const double size_mib = prompt_cache->size() / (1024.0 * 1024.0);
+            const double limit_mib = prompt_cache->limit_size / (1024.0 * 1024.0);
+            const std::string limit = prompt_cache->limit_size > 0
+                ? string_format("%.1f MiB", limit_mib)
+                : "unlimited";
+            SLT_INF(slot, "L2 PROMPT CACHE | entries=%zu state=%.1f MiB/%s tokens=%zu limit=%zu\n",
+                    prompt_cache->states.size(), size_mib, limit.c_str(), prompt_cache->n_tokens(), prompt_cache->limit_tokens);
+        } else {
+            SLT_INF(slot, "%s", "L2 PROMPT CACHE | disabled\n");
         }
     }
 
