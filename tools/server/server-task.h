@@ -563,14 +563,24 @@ struct server_task_result_apply_lora : server_task_result {
     virtual json to_json() override;
 };
 
+struct server_prompt_checkpoint : common_prompt_checkpoint {
+    bool is_response = false;
+    int64_t t_created = 0;
+    int64_t t_last_used = 0;
+    uint32_t n_hits = 0;
+};
+
 struct server_prompt {
     server_tokens tokens;
 
-    std::list<common_prompt_checkpoint> checkpoints;
+    std::list<server_prompt_checkpoint> checkpoints;
+
+    int32_t n_responses = 0;
 
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        n_responses = 0;
     }
 
     int n_tokens() const {
@@ -581,6 +591,7 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            n_responses,
         };
     }
 };

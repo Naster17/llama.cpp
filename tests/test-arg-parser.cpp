@@ -269,6 +269,25 @@ static void test(void) {
     }
 
     {
+        common_params checkpoint_params;
+        argv = {"binary_name", "--cache-after-resp"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), checkpoint_params, LLAMA_EXAMPLE_SERVER));
+        assert(checkpoint_params.n_cache_after_resp == 1);
+
+        argv = {"binary_name", "--cache-after-resp", "3"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), checkpoint_params, LLAMA_EXAMPLE_SERVER));
+        assert(checkpoint_params.n_cache_after_resp == 3);
+
+        argv = {"binary_name", "--cache-after-resp", "--ctx-size", "512"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), checkpoint_params, LLAMA_EXAMPLE_SERVER));
+        assert(checkpoint_params.n_cache_after_resp == 1);
+        assert(checkpoint_params.n_ctx == 512);
+
+        argv = {"binary_name", "--cache-after-resp", "-1"};
+        assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), checkpoint_params, LLAMA_EXAMPLE_SERVER));
+    }
+
+    {
         common_params synth_params;
         argv = {"binary_name", "--spec-synth-len", "3.4x"};
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));

@@ -114,6 +114,11 @@ common_arg & common_arg::set_preset_only() {
     return *this;
 }
 
+common_arg & common_arg::set_value_optional(int value) {
+    value_optional = value;
+    return *this;
+}
+
 bool common_arg::in_example(enum llama_example ex) {
     return examples.find(ex) != examples.end();
 }
@@ -810,6 +815,19 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         }
     };
 
+    auto next_arg_is_option = [&](int i) {
+        if (i+1 >= argc) {
+            return true;
+        }
+
+        std::string arg = argv[i + 1];
+        if (arg.compare(0, 2, "--") == 0) {
+            std::replace(arg.begin(), arg.end(), '_', '-');
+        }
+
+        return arg_to_options.find(arg) != arg_to_options.end();
+    };
+
     auto parse_cli_args = [&]() {
         std::set<std::string> seen_args;
 
@@ -847,6 +865,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 }
 
                 // arg with single value
+                if (opt.value_optional >= 0 && next_arg_is_option(i)) {
+                    GGML_ASSERT(opt.handler_int);
+                    opt.handler_int(params, opt.value_optional);
+                    continue;
+                }
                 check_arg(i);
                 std::string val = argv[++i];
                 if (opt.handler_int) {
@@ -1709,6 +1732,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.checkpoint_min_step = value;
         }
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"-car", "--cache-after-resp"}, "[N]",
+        string_format("create a context checkpoint every N completed responses (bare option = 1, 0 = disabled, default: %d)", params.n_cache_after_resp),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("cache-after-resp must be non-negative");
+            }
+            params.n_cache_after_resp = value;
+        }
+    ).set_value_optional(1).set_env("LLAMA_ARG_CACHE_AFTER_RESP").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
         string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"

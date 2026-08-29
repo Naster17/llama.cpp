@@ -334,6 +334,17 @@ struct server_slot {
     void prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
+        if (!prompt.checkpoints.empty()) {
+            const int64_t t_now = ggml_time_us();
+            for (const auto & checkpoint : prompt.checkpoints) {
+                const double age_s = checkpoint.t_created > 0 ? (t_now - checkpoint.t_created) / 1e6 : 0.0;
+                SLT_INF(*this, "ckpt: evict reason=prompt-clear kind=%s tok=%" PRId64 " pos=[%d,%d] size=%.3fMiB age=%.1fs hits=%u\n",
+                        checkpoint.is_response ? "response" : "prompt", checkpoint.n_tokens,
+                        checkpoint.pos_min, checkpoint.pos_max, checkpoint.size() / (1024.0 * 1024.0),
+                        age_s, checkpoint.n_hits);
+            }
+        }
+
         mem.seq_rm(id, -1, -1);
 
         prompt.clear();
@@ -612,7 +623,10 @@ struct server_slot {
         t_print_last = t_now;
         n_gen_last = stats.n_gen;
 
-        SLT_INF(*this, "n_gen = %6d, tg = %6.2f t/s, tg_3s = %6.2f t/s\n", (int) stats.n_gen, n_gen_second, n_gen_second_win);
+        const char * color = common_log_get_colors() ? LOG_COL_MAGENTA : "";
+        const char * reset = common_log_get_colors() ? LOG_COL_DEFAULT : "";
+        SLT_INF(*this, "timing: %sTG%s gen=%d speed=%.2ft/s recent=%.2ft/s elapsed=%.2fs\n",
+                color, reset, (int) stats.n_gen, n_gen_second, n_gen_second_win, stats.t_gen_ms() / 1e3);
     }
 
     void print_timings_pp() const {
@@ -625,35 +639,29 @@ struct server_slot {
         const double n_prompt_second = stats.n_prompt_tps();
         const double f_progress = task->n_tokens() > 0 ? (double) prompt.n_tokens() / task->n_tokens() : 0.0;
 
-        SLT_INF(*this, "prompt processing, n_tokens = %6d, progress = %.2f, t = %6.2f s / %.2f tokens per second\n",
-                (int) stats.n_prompt_processed, f_progress, t_prompt_total / 1e3, n_prompt_second);
+        const char * color = common_log_get_colors() ? LOG_COL_CYAN : "";
+        const char * reset = common_log_get_colors() ? LOG_COL_DEFAULT : "";
+        SLT_INF(*this, "timing: %sPP%s processed=%d/%d progress=%.1f%% speed=%.2ft/s elapsed=%.2fs\n",
+                color, reset, (int) stats.n_prompt_processed, task->n_tokens(), 100.0 * f_progress,
+                n_prompt_second, t_prompt_total / 1e3);
     }
 
     void print_timings() const {
         const double t_prompt_total = stats.t_prompt_ms();
         const double t_gen_total    = stats.t_gen_ms();
 
-        const double t_prompt        = stats.t_prompt_per_token_ms();
         const double n_prompt_second = stats.n_prompt_tps();
 
-        const double t_gen        = stats.t_gen_per_token_ms();
         const double n_gen_second = stats.n_gen_tps();
+        const double t_total = t_prompt_total + t_gen_total;
+        const char * pp_color = common_log_get_colors() ? LOG_COL_CYAN : "";
+        const char * tg_color = common_log_get_colors() ? LOG_COL_MAGENTA : "";
+        const char * reset    = common_log_get_colors() ? LOG_COL_DEFAULT : "";
 
-        SLT_INF(*this,
-                "prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
-                t_prompt_total, (int) stats.n_prompt_processed, t_prompt, n_prompt_second);
-
-        SLT_INF(*this,
-                "       eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
-                t_gen_total, (int) stats.n_gen, t_gen, n_gen_second);
-
-        SLT_INF(*this,
-                "      total time = %10.2f ms / %5d tokens\n",
-                t_prompt_total + t_gen_total, (int) (stats.n_prompt_processed + stats.n_gen));
-
-        SLT_INF(*this,
-                "   graphs reused = %10d\n",
-                llama_perf_context(ctx_tgt).n_reused);
+        SLT_INF(*this, "timing: cache=%" PRIu64 " %sPP%s=%" PRIu64 "tok %.2ft/s %.2fs %sTG%s=%" PRIu64 "tok %.2ft/s %.2fs total=%.2fs graphs=%d\n",
+                stats.n_prompt_cached, pp_color, reset, stats.n_prompt_processed, n_prompt_second,
+                t_prompt_total / 1e3, tg_color, reset, stats.n_gen, n_gen_second, t_gen_total / 1e3,
+                t_total / 1e3, llama_perf_context(ctx_tgt).n_reused);
 
         const int32_t n_draft_total       = stats.n_draft_tokens;
         const int32_t n_draft_accepted    = stats.n_draft_accepted;
@@ -1363,8 +1371,11 @@ private:
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
         if (params_base.n_ctx_checkpoints > 0) {
-            SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
+            SRV_INF("ckpt: enabled cap=%d min-spacing=%d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
+            if (params_base.n_cache_after_resp > 0) {
+                SRV_INF("response checkpoints enabled, every %d completed responses\n", params_base.n_cache_after_resp);
+            }
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
         }
@@ -2294,39 +2305,98 @@ private:
         return true;
     }
 
+    const char * checkpoint_kind(const server_prompt_checkpoint & checkpoint) const {
+        return checkpoint.is_response ? "response" : "prompt";
+    }
+
+    void log_checkpoint(const server_slot & slot, const server_prompt_checkpoint & checkpoint, const char * event) const {
+        const int64_t t_now = ggml_time_us();
+        const double age_s = checkpoint.t_created > 0 ? (t_now - checkpoint.t_created) / 1e6 : 0.0;
+        const double idle_s = checkpoint.t_last_used > 0 ? (t_now - checkpoint.t_last_used) / 1e6 : age_s;
+
+        SLT_INF(slot, "ckpt: %s kind=%s tok=%" PRId64 " pos=[%d,%d] size=%.3fMiB age=%.1fs idle=%.1fs hits=%u\n",
+                event, checkpoint_kind(checkpoint), checkpoint.n_tokens, checkpoint.pos_min, checkpoint.pos_max,
+                checkpoint.size() / (1024.0 * 1024.0), age_s, idle_s, checkpoint.n_hits);
+    }
+
+    void log_checkpoints(const server_slot & slot) const {
+        if (common_log_get_verbosity_thold() < LOG_LEVEL_INFO) {
+            return;
+        }
+
+        size_t size = 0;
+        for (const auto & checkpoint : slot.prompt.checkpoints) {
+            size += checkpoint.size();
+        }
+
+        SLT_INF(slot, "ckpt: inventory count=%zu/%d size=%.3fMiB responses=%d\n",
+                slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, size / (1024.0 * 1024.0),
+                slot.prompt.n_responses);
+
+        for (const auto & checkpoint : slot.prompt.checkpoints) {
+            log_checkpoint(slot, checkpoint, "stored");
+        }
+    }
+
+    void clear_checkpoints(server_slot & slot, const char * reason) {
+        for (const auto & checkpoint : slot.prompt.checkpoints) {
+            log_checkpoint(slot, checkpoint, reason);
+        }
+
+        slot.prompt.checkpoints.clear();
+        slot.prompt.n_responses = 0;
+        SLT_INF(slot, "ckpt: inventory count=0/%d size=0.000MiB responses=0\n", params_base.n_ctx_checkpoints);
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool is_response = false) {
         const int id_task = slot.task->id;
 
-        // evict checkpoints within min-step of a previous checkpoint, unless they were
-        // created by the current task
-        int64_t last = -1;
-        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-            if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
-                SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                        it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
+        if (!is_response && params_base.n_cache_after_resp <= 0) {
+            // Response checkpoints deliberately follow short responses, so do not evict them
+            // according to the prompt checkpoint spacing policy.
+            int64_t last = -1;
+            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
+                if (it->is_response) {
+                    ++it;
+                    continue;
+                }
 
-                it = slot.prompt.checkpoints.erase(it);
-                continue;
+                if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+                    log_checkpoint(slot, *it, "evict reason=spacing");
+
+                    it = slot.prompt.checkpoints.erase(it);
+                    continue;
+                }
+
+                last = it->n_tokens;
+                ++it;
             }
-
-            last = it->n_tokens;
-            ++it;
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            auto it = slot.prompt.checkpoints.begin();
+            if (params_base.n_cache_after_resp > 0) {
+                it = std::min_element(
+                        slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                        [](const auto & a, const auto & b) {
+                            return a.t_last_used < b.t_last_used;
+                        });
+            }
+            const auto & cur = *it;
 
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+            log_checkpoint(slot, cur, params_base.n_cache_after_resp > 0 ? "evict reason=lru-cap" : "evict reason=cap");
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.prompt.checkpoints.erase(it);
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
         cur.id_task = id_task;
+        cur.is_response = is_response;
+        cur.t_created = ggml_time_us();
+        cur.t_last_used = cur.t_created;
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
@@ -2338,10 +2408,38 @@ private:
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
-        SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+        log_checkpoint(slot, cur, "create");
+        log_checkpoints(slot);
+    }
+
+    void maybe_create_response_checkpoint(server_slot & slot) {
+        const int every = params_base.n_cache_after_resp;
+        if (every <= 0 || params_base.n_ctx_checkpoints <= 0 ||
+                slot.task->type != SERVER_TASK_TYPE_COMPLETION || slot.task->is_child()) {
+            return;
+        }
+
+        const bool need_checkpoint =
+            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+            n_swa > 0;
+        if (!need_checkpoint || slot.prompt.n_tokens() == 0) {
+            return;
+        }
+
+        slot.prompt.n_responses++;
+        if (slot.prompt.n_responses % every != 0) {
+            SLT_INF(slot, "ckpt: skip kind=response response=%d every=%d\n", slot.prompt.n_responses, every);
+            return;
+        }
+
+        const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+        const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        if (pos_min < 0) {
+            return;
+        }
+
+        create_checkpoint(slot, 0, pos_min, pos_max, true);
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -3135,6 +3233,7 @@ private:
 
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
+                        bool has_common_prefix = false;
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -3261,6 +3360,8 @@ private:
                                 n_past = 0;
                             }
 
+                            has_common_prefix = n_past > 0;
+
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
@@ -3346,12 +3447,17 @@ private:
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        auto & checkpoint = *std::prev(it.base());
+                                        checkpoint.n_hits++;
+                                        checkpoint.t_last_used = ggml_time_us();
+                                        log_checkpoint(slot, checkpoint, "hit restore");
+                                        SLT_INF(slot, "ckpt: restore past=%d next=%d threshold=%d\n", n_past, pos_next, pos_min_thold);
+                                        log_checkpoints(slot);
                                     }
 
                                     if (do_reset) {
-                                        SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
-                                                "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
+                                        SLT_INF(slot, "ckpt: miss action=full-reprocess next=%d threshold=%d retained=%zu\n",
+                                                pos_next, pos_min_thold, slot.prompt.checkpoints.size());
                                         pos_next = 0;
                                         n_past = 0;
                                     }
@@ -3363,7 +3469,7 @@ private:
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
                                     if (cur.pos_max > pos_next) {
-                                        SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                        log_checkpoint(slot, cur, "evict reason=invalid");
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
@@ -3383,6 +3489,18 @@ private:
                         slot.stats.n_prompt_processed = 0;
 
                         metrics.add_prompt_cached(n_past);
+
+                        if (n_past > 0) {
+                            SLT_INF(slot, "cache: hit source=live-kv cached=%d request=%d\n", n_past, slot.task->n_tokens());
+                        } else {
+                            SLT_INF(slot, "cache: miss source=live-kv request=%d\n", slot.task->n_tokens());
+                        }
+
+                        if (!has_common_prefix) {
+                            if (!slot.prompt.checkpoints.empty() || slot.prompt.n_responses > 0) {
+                                clear_checkpoints(slot, "evict reason=no-common-prefix");
+                            }
+                        }
 
                         slot.prompt.tokens.keep_first(n_past);
 
@@ -3858,6 +3976,7 @@ private:
             if (!process_token(result, slot)) {
                 // release slot because of stop condition
                 slot.print_timings();
+                maybe_create_response_checkpoint(slot);
                 send_final_response(slot);
                 slot.release();
 
@@ -3983,6 +4102,7 @@ private:
 
                 if (!process_token(result, slot)) {
                     slot.print_timings();
+                    maybe_create_response_checkpoint(slot);
                     send_final_response(slot);
                     slot.release();
 

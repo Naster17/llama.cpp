@@ -66,6 +66,12 @@ static const char* g_col[] = {
     "",
 };
 
+static bool common_log_colors = false;
+
+bool common_log_get_colors(void) {
+    return common_log_colors;
+}
+
 struct common_log_entry {
     enum ggml_log_level level {GGML_LOG_LEVEL_INFO};
 
@@ -345,6 +351,8 @@ public:
                 g_col[i] = "";
             }
         }
+
+        common_log_colors = colors;
 
         resume();
     }

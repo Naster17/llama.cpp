@@ -42,6 +42,7 @@ enum log_colors {
 int  common_log_get_verbosity_thold(void);
 
 void common_log_set_verbosity_thold(int verbosity); // not thread-safe
+bool common_log_get_colors(void);
 
 void common_log_default_callback(enum ggml_log_level level, const char * text, void * user_data);
 

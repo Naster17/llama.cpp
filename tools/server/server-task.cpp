@@ -1714,7 +1714,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
-            SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
+            SRV_INF("pcache: save skip reason=already-stored tok=%d\n", cur_lcp_len);
             return nullptr;
         }
     }
@@ -1739,7 +1739,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (len == (int) it->prompt.tokens.size()) {
-            SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
+            SRV_INF("pcache: evict reason=contained tok=%d size=%.3fMiB checkpoints=%zu\n",
+                    len, it->size() / (1024.0 * 1024.0), it->prompt.checkpoints.size());
 
             it = states.erase(it);
         } else {
@@ -1750,8 +1751,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
         while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
+            SRV_INF("pcache: evict reason=size tok=%d size=%.3fMiB checkpoints=%zu\n",
+                    states.front().prompt.n_tokens(), states.front().size() / (1024.0 * 1024.0),
+                    states.front().prompt.checkpoints.size());
 
             states.pop_front();
         }
@@ -1780,6 +1782,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
             /*.checkpoints =*/ prompt.checkpoints,
+            /*.n_responses =*/ prompt.n_responses,
         },
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
@@ -1787,11 +1790,14 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         },
     });
 
+    SRV_INF("pcache: save stored tok=%d state=%.3fMiB checkpoints=%zu entries=%zu\n",
+            prompt.n_tokens(), state_size_new / (1024.0 * 1024.0), prompt.checkpoints.size(), states.size());
+
     return &states.back();
 }
 
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
+    int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
     float f_sim_best  = float(lcp_best) / tokens_new.size();
@@ -1815,6 +1821,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
 
         if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+            lcp_best = lcp_cur;
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
 
@@ -1823,7 +1830,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     }
 
     if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+        const int n_tokens = it_best->prompt.n_tokens();
+        const size_t n_checkpoints = it_best->prompt.checkpoints.size();
+        const size_t state_size = it_best->size();
 
         {
             auto & data = it_best->data.main;
@@ -1862,6 +1871,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         prompt = std::move(it_best->prompt);
 
         states.erase(it_best);
+        SRV_INF("pcache: hit tok=%d lcp=%d keep=%.3f sim=%.3f state=%.3fMiB checkpoints=%zu entries=%zu\n",
+                n_tokens, lcp_best, f_keep_best, f_sim_best, state_size / (1024.0 * 1024.0),
+                n_checkpoints, states.size());
+    } else {
+        SRV_INF("pcache: miss request=%zu entries=%zu\n", tokens_new.size(), states.size());
     }
 
     return true;
@@ -1870,7 +1884,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 void server_prompt_cache::update() {
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+            SRV_INF("pcache: evict reason=lru-size tok=%d size=%.3fMiB checkpoints=%zu\n",
+                    states.front().prompt.n_tokens(), states.front().size() / (1024.0 * 1024.0),
+                    states.front().prompt.checkpoints.size());
 
             states.pop_front();
         }
@@ -1884,8 +1900,9 @@ void server_prompt_cache::update() {
 
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+            SRV_INF("pcache: evict reason=lru-tokens tok=%d size=%.3fMiB checkpoints=%zu\n",
+                    states.front().prompt.n_tokens(), states.front().size() / (1024.0 * 1024.0),
+                    states.front().prompt.checkpoints.size());
 
             states.pop_front();
         }
