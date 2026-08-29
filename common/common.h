@@ -1170,6 +1170,8 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
+    uint64_t tok_hash = 0;
+
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
 

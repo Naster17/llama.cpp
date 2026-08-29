@@ -2276,14 +2276,53 @@ private:
         return true;
     }
 
+    static uint64_t hash_prefix_tokens(const server_tokens & toks, int64_t n) {
+        if (toks.has_mtmd || n <= 0 || n > (int64_t) toks.size()) {
+            return 0;
+        }
+        uint64_t h = 1469598103934665603ULL;
+        for (int64_t i = 0; i < n; ++i) {
+            h ^= (uint64_t) (uint32_t) toks[i];
+            h *= 1099511628211ULL;
+        }
+        return h == 0 ? 1 : h;
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
-        // note: do not evict checkpoints based on how close they are to each other (the old
-        //       min-step eviction dropped almost all per-turn checkpoints, causing cache misses).
-        //       checkpoints are only evicted once their count reaches n_ctx_checkpoints, oldest
-        //       first, see below. invalid ones (pos_max > pos_next) are erased on reuse instead.
+        const int64_t new_n_tokens = slot.prompt.n_tokens() - n_tokens_cur;
+        uint64_t new_hash = 0;
+        if (params_base.cache_after_resp && new_n_tokens > 0 && !slot.prompt.tokens.has_mtmd) {
+            new_hash = hash_prefix_tokens(slot.prompt.tokens, new_n_tokens);
+            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
+                if (it->tok_hash != 0 && it->tok_hash == new_hash && it->n_tokens == new_n_tokens) {
+                    SLT_TRC(slot, "replacing duplicate context checkpoint (n_tokens = %" PRId64 ", hash = %016" PRIx64 ")\n", it->n_tokens, it->tok_hash);
+                    it = slot.prompt.checkpoints.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        // evict checkpoints within min-step of a previous checkpoint, unless they were
+        // created by the current task
+        int64_t last = -1;
+        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
+            // with --cache-after-resp, checkpoints are intentionally spaced by whole responses,
+            // so the min-step eviction would wrongly drop the retained response checkpoints
+            if (!params_base.cache_after_resp && it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
+                SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                        it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
+
+                it = slot.prompt.checkpoints.erase(it);
+                continue;
+            }
+
+            last = it->n_tokens;
+            ++it;
+        }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
@@ -2302,7 +2341,8 @@ private:
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
-        cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+        cur.update_pos(new_n_tokens, pos_min, pos_max);
+        cur.tok_hash = new_hash;
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -3281,16 +3321,17 @@ private:
                             // the largest pos_min required for a checkpoint to be useful
                             const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
 
-                            if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
+                            const bool use_hash_ckpt = params_base.cache_after_resp && !input_tokens.has_mtmd && !slot.prompt.tokens.has_mtmd;
+                            if ((n_past > 0 || (params_base.cache_after_resp && !slot.prompt.checkpoints.empty())) && n_past <= (int) slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
-                                if (pos_min == -1) {
+                                if (n_past > 0 && pos_min == -1) {
                                     SLT_ERR(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min);
                                     GGML_ABORT("pos_min == -1, but n_past > 0 - should not happen: https://github.com/ggml-org/llama.cpp/pull/13833#discussion_r2116181237");
                                 }
 
                                 // when the prompt prefix does not match, print the tokens around the mismatch
                                 // this is useful for debugging prompt caching
-                                if (slots_debug) {
+                                if (n_past > 0 && slots_debug) {
                                     const int np0 = std::max<int>(n_past - slots_n_diff, 0);
                                     const int np1 = std::min<int>(n_past + slots_n_diff + 2, std::min(slot.prompt.tokens.size(), slot.task->tokens.size()));
 
@@ -3331,12 +3372,30 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                if (pos_min >= pos_min_thold || use_hash_ckpt) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
                                         slot.prompt.checkpoints.rend(),
                                         [&](const auto & cur) {
+                                            if (use_hash_ckpt) {
+                                                if (cur.tok_hash == 0) {
+                                                    return false;
+                                                }
+                                                if (cur.n_tokens > slot.task->n_tokens()) {
+                                                    return false;
+                                                }
+                                                uint64_t h = 1469598103934665603ULL;
+                                                for (int64_t i = 0; i < cur.n_tokens; ++i) {
+                                                    h ^= (uint64_t) (uint32_t) input_tokens[i];
+                                                    h *= 1099511628211ULL;
+                                                }
+                                                if (h == 0) {
+                                                    h = 1;
+                                                }
+                                                SLT_TRC(slot, "checking checkpoint with [%d, %d] n_tokens = %" PRId64 " hash = %016" PRIx64 " task_hash = %016" PRIx64 " %s against %d\n", cur.pos_min, cur.pos_max, cur.n_tokens, cur.tok_hash, h, h == cur.tok_hash ? "MATCH" : "no", pos_min_thold);
+                                                return h == cur.tok_hash;
+                                            }
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
                                             // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
@@ -3356,11 +3415,21 @@ private:
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
 
-                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                        if (use_hash_ckpt) {
+                                            {
+                                                server_tokens tmp = input_tokens.clone();
+                                                tmp.keep_first(it->n_tokens);
+                                                slot.prompt.tokens = std::move(tmp);
+                                            }
+                                            pos_next = input_tokens.pos_next(it->n_tokens);
+                                            n_past   = (int) it->n_tokens;
+                                        } else {
+                                            pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                            n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                        }
 
                                         if (params_base.cache_after_resp) {
-                                            SLT_INF(slot, "restored context checkpoint from previous response (n_tokens = %" PRId64 ")\n", it->n_tokens);
+                                            SLT_INF(slot, "restored context checkpoint from previous response (n_tokens = %" PRId64 " hash = %016" PRIx64 ")\n", it->n_tokens, it->tok_hash);
                                         }
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                     }
@@ -3374,7 +3443,7 @@ private:
                                 }
                             }
 
-                            {
+                            if (!params_base.cache_after_resp) {
                                 // erase any checkpoints with pos_max > pos_next
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
