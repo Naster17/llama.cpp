@@ -3432,6 +3432,12 @@ private:
                                             SLT_INF(slot, "restored context checkpoint from previous response (n_tokens = %" PRId64 " hash = %016" PRIx64 ")\n", it->n_tokens, it->tok_hash);
                                         }
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+                                        if (use_hash_ckpt) {
+                                            auto fwd = std::prev(it.base());
+                                            auto ckpt = std::move(*fwd);
+                                            slot.prompt.checkpoints.erase(fwd);
+                                            slot.prompt.checkpoints.push_back(std::move(ckpt));
+                                        }
                                     }
 
                                     if (do_reset) {
