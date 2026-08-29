@@ -3367,78 +3367,76 @@ private:
                                 }
 
                                 if (pos_min >= pos_min_thold || use_hash_ckpt) {
-                                    // search for a context checkpoint
-                                    const auto it = std::find_if(
-                                        slot.prompt.checkpoints.rbegin(),
-                                        slot.prompt.checkpoints.rend(),
-                                        [&](const auto & cur) {
-                                            if (use_hash_ckpt) {
-                                                if (cur.tok_hash == 0) {
-                                                    return false;
-                                                }
-                                                if (cur.n_tokens > slot.task->n_tokens()) {
-                                                    return false;
-                                                }
+                                    auto hit_it = slot.prompt.checkpoints.rend();
+                                    bool is_hash_hit = false;
+                                    if (use_hash_ckpt) {
+                                        hit_it = std::find_if(
+                                            slot.prompt.checkpoints.rbegin(),
+                                            slot.prompt.checkpoints.rend(),
+                                            [&](const auto & cur) {
+                                                if (cur.tok_hash == 0) return false;
+                                                if (cur.n_tokens > slot.task->n_tokens()) return false;
                                                 uint64_t h = 1469598103934665603ULL;
                                                 for (int64_t i = 0; i < cur.n_tokens; ++i) {
                                                     h ^= (uint64_t) (uint32_t) input_tokens[i];
                                                     h *= 1099511628211ULL;
                                                 }
-                                                if (h == 0) {
-                                                    h = 1;
-                                                }
+                                                if (h == 0) h = 1;
                                                 SLT_TRC(slot, "checking checkpoint with [%d, %d] n_tokens = %" PRId64 " hash = %016" PRIx64 " task_hash = %016" PRIx64 " %s against %d\n", cur.pos_min, cur.pos_max, cur.n_tokens, cur.tok_hash, h, h == cur.tok_hash ? "MATCH" : "no", pos_min_thold);
                                                 return h == cur.tok_hash;
-                                            }
-                                            // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
-                                            SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
-                                            // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
-                                            if (cur.pos_max > pos_next) {
-                                                return false;
-                                            }
-                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
-                                        }
-                                    );
-
-                                    bool do_reset = it == slot.prompt.checkpoints.rend();
-
-                                    if (!do_reset) {
+                                            });
+                                        if (hit_it != slot.prompt.checkpoints.rend()) is_hash_hit = true;
+                                    }
+                                    if (hit_it == slot.prompt.checkpoints.rend() && pos_min >= pos_min_thold) {
+                                        hit_it = std::find_if(
+                                            slot.prompt.checkpoints.rbegin(),
+                                            slot.prompt.checkpoints.rend(),
+                                            [&](const auto & cur) {
+                                                SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
+                                                if (cur.pos_max > pos_next) return false;
+                                                return cur.pos_min < pos_min_thold || cur.pos_min == 0;
+                                            });
+                                    }
+                                    bool do_hit = hit_it != slot.prompt.checkpoints.rend();
+                                    if (do_hit) {
                                         {
-                                            auto fwd = std::prev(it.base());
+                                            auto fwd = std::prev(hit_it.base());
                                             fwd->hits++;
                                         }
-                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
-                                        if (use_hash_ckpt) {
+                                        hit_it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        hit_it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                        common_speculative_set_state(spec.get(), slot.id, hit_it->data_spec);
+                                        if (is_hash_hit) {
                                             {
                                                 server_tokens tmp = input_tokens.clone();
-                                                tmp.keep_first(it->n_tokens);
+                                                tmp.keep_first(hit_it->n_tokens);
                                                 slot.prompt.tokens = std::move(tmp);
                                             }
-                                            pos_next = input_tokens.pos_next(it->n_tokens);
-                                            n_past   = (int) it->n_tokens;
+                                            pos_next = input_tokens.pos_next(hit_it->n_tokens);
+                                            n_past   = (int) hit_it->n_tokens;
                                         } else {
-                                            pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                            n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                            pos_next = std::min(pos_next, std::max(hit_it->pos_min + 1, hit_it->pos_max));
+                                            n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) hit_it->n_tokens);
                                         }
                                         {
-                                            auto fwd = std::prev(it.base());
+                                            auto fwd = std::prev(hit_it.base());
                                             float ckpt_mib = (float) fwd->size() / 1024 / 1024;
                                             SLT_INF(slot, "%sCACHE HIT%s | restored n=%" PRId64 " pos=[%d,%d] hash=%08x %.1f MiB hits=%" PRIu64 " n_past=%d\n", LOG_COL_GREEN, LOG_COL_DEFAULT, fwd->n_tokens, fwd->pos_min, fwd->pos_max, (uint32_t) fwd->tok_hash, ckpt_mib, fwd->hits, n_past);
                                             log_cache_state(slot, "CACHE STATE", LOG_COL_GREEN, &*fwd);
                                         }
-                                        if (use_hash_ckpt) {
-                                            auto fwd = std::prev(it.base());
+                                        if (is_hash_hit) {
+                                            auto fwd = std::prev(hit_it.base());
                                             auto ckpt = std::move(*fwd);
                                             slot.prompt.checkpoints.erase(fwd);
                                             slot.prompt.checkpoints.push_back(std::move(ckpt));
                                         }
                                     } else {
-                                        SLT_INF(slot, "%sCACHE MISS%s | no checkpoint for n_past=%d pos_next=%d thold=%d n_ckpt=%zu\n", LOG_COL_YELLOW, LOG_COL_DEFAULT, n_past, pos_next, pos_min_thold, slot.prompt.checkpoints.size());
-                                        log_cache_state(slot, "CACHE MISS", LOG_COL_YELLOW, nullptr);
-                                        pos_next = 0;
-                                        n_past = 0;
+                                        if (pos_min >= pos_min_thold) {
+                                            SLT_INF(slot, "%sCACHE MISS%s | no checkpoint for n_past=%d pos_next=%d thold=%d n_ckpt=%zu\n", LOG_COL_YELLOW, LOG_COL_DEFAULT, n_past, pos_next, pos_min_thold, slot.prompt.checkpoints.size());
+                                            log_cache_state(slot, "CACHE MISS", LOG_COL_YELLOW, nullptr);
+                                            pos_next = 0;
+                                            n_past = 0;
+                                        }
                                     }
                                 }
                             }
