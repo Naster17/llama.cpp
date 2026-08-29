@@ -2405,12 +2405,11 @@ private:
 
         const double lru_age_s = slot_lru && slot_lru->t_last_used > 0 ? (t_now - slot_lru->t_last_used) / 1e6 : 0.0;
         const int n_checkpoints_max = (int) slots.size() * params_base.n_ctx_checkpoints;
-        const std::string lru_oldest = slot_lru
-            ? string_format("id=%d age=%.0fs", slot_lru->id, lru_age_s)
+        const std::string lru = slot_lru
+            ? string_format("id=%d %.0fs", slot_lru->id, lru_age_s)
             : "none";
-        SLT_INF(slot, "CACHE METRICS | slots idle=%zu busy=%zu lru=%zu oldest=%s | live=%zu tok | checkpoints=%zu/%d response=%zu %.1f MiB\n",
-                n_slots_idle, n_slots_busy, n_slots_idle,
-                lru_oldest.c_str(),
+        SLT_INF(slot, "METRICS | slots=%zu/%zu lru=%s | live=%zu tok | ckpt=%zu/%d resp=%zu %.1f MiB\n",
+                n_slots_idle, n_slots_busy, lru.c_str(),
                 n_tokens_live, n_checkpoints, n_checkpoints_max, n_checkpoints_response, size_checkpoints / (1024.0 * 1024.0));
 
         if (prompt_cache) {
