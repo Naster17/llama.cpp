@@ -2280,23 +2280,10 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
-        // evict checkpoints within min-step of a previous checkpoint, unless they were
-        // created by the current task
-        int64_t last = -1;
-        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-            // with --cache-after-resp, checkpoints are intentionally spaced by whole responses,
-            // so the min-step eviction would wrongly drop the retained response checkpoints
-            if (!params_base.cache_after_resp && it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
-                SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                        it->pos_min, it->pos_max, it->n_tokens, (float) it->size() / 1024 / 1024);
-
-                it = slot.prompt.checkpoints.erase(it);
-                continue;
-            }
-
-            last = it->n_tokens;
-            ++it;
-        }
+        // note: do not evict checkpoints based on how close they are to each other (the old
+        //       min-step eviction dropped almost all per-turn checkpoints, causing cache misses).
+        //       checkpoints are only evicted once their count reaches n_ctx_checkpoints, oldest
+        //       first, see below. invalid ones (pos_max > pos_next) are erased on reuse instead.
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
