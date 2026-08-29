@@ -602,61 +602,45 @@ struct server_slot {
         if (stats.n_gen < 100) {
             return;
         }
-
         const int64_t t_now = ggml_time_us();
-
         if (t_now - t_print_last < 3*1000*1000) {
             return;
         }
-
         const double n_gen_second     = stats.n_gen_tps();
         const double n_gen_second_win = 1e6 / (t_now - t_print_last) * (stats.n_gen - n_gen_last);
-
         t_print_last = t_now;
         n_gen_last = stats.n_gen;
-
-        SLT_INF(*this, "n_gen = %6d, tg = %6.2f t/s, tg_3s = %6.2f t/s\n", (int) stats.n_gen, n_gen_second, n_gen_second_win);
+        SLT_INF(*this, "%sTG%s | n_gen=%6d | %s%6.2f%s t/s avg | %s%6.2f%s t/s win\n",
+                LOG_COL_GREEN, LOG_COL_DEFAULT, (int) stats.n_gen, LOG_COL_BOLD, n_gen_second, LOG_COL_DEFAULT, LOG_COL_GREEN, n_gen_second_win, LOG_COL_DEFAULT);
     }
 
     void print_timings_pp() const {
         const double t_prompt_total = stats.t_prompt_ms();
-
         if (t_prompt_total < 3000.0) {
             return;
         }
-
         const double n_prompt_second = stats.n_prompt_tps();
         const double f_progress = task->n_tokens() > 0 ? (double) prompt.n_tokens() / task->n_tokens() : 0.0;
-
-        SLT_INF(*this, "prompt processing, n_tokens = %6d, progress = %.2f, t = %6.2f s / %.2f tokens per second\n",
-                (int) stats.n_prompt_processed, f_progress, t_prompt_total / 1e3, n_prompt_second);
+        SLT_INF(*this, "%sPP%s | n=%6d/%6d | prog=%3.0f%% | %6.2fs | %s%6.1f%s tok/s | cached %d\n",
+                LOG_COL_CYAN, LOG_COL_DEFAULT, (int) stats.n_prompt_processed, task->n_tokens(), f_progress*100, t_prompt_total/1e3, LOG_COL_BOLD, n_prompt_second, LOG_COL_DEFAULT, (int) stats.n_prompt_cached);
     }
 
     void print_timings() const {
         const double t_prompt_total = stats.t_prompt_ms();
         const double t_gen_total    = stats.t_gen_ms();
-
         const double t_prompt        = stats.t_prompt_per_token_ms();
         const double n_prompt_second = stats.n_prompt_tps();
-
         const double t_gen        = stats.t_gen_per_token_ms();
         const double n_gen_second = stats.n_gen_tps();
-
-        SLT_INF(*this,
-                "prompt eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
-                t_prompt_total, (int) stats.n_prompt_processed, t_prompt, n_prompt_second);
-
-        SLT_INF(*this,
-                "       eval time = %10.2f ms / %5d tokens (%8.2f ms per token, %8.2f tokens per second)\n",
-                t_gen_total, (int) stats.n_gen, t_gen, n_gen_second);
-
-        SLT_INF(*this,
-                "      total time = %10.2f ms / %5d tokens\n",
-                t_prompt_total + t_gen_total, (int) (stats.n_prompt_processed + stats.n_gen));
-
-        SLT_INF(*this,
-                "   graphs reused = %10d\n",
-                llama_perf_context(ctx_tgt).n_reused);
+        const int cached = stats.n_prompt_cached;
+        const int total_tok = stats.n_prompt_processed + stats.n_gen;
+        const double total_ms = t_prompt_total + t_gen_total;
+        SLT_INF(*this, "%sPP%s %5d tok | %7.1f ms | %5.1f ms/tok | %s%6.1f%s tok/s | cached %d/%d\n",
+                LOG_COL_CYAN, LOG_COL_DEFAULT, (int) stats.n_prompt_processed, t_prompt_total, t_prompt, LOG_COL_BOLD, n_prompt_second, LOG_COL_DEFAULT, cached, (int) stats.n_prompt_processed);
+        SLT_INF(*this, "%sTG%s %5d tok | %7.1f ms | %5.1f ms/tok | %s%6.1f%s tok/s\n",
+                LOG_COL_GREEN, LOG_COL_DEFAULT, (int) stats.n_gen, t_gen_total, t_gen, LOG_COL_BOLD, n_gen_second, LOG_COL_DEFAULT);
+        SLT_INF(*this, "%sPERF%s total %4d tok | %7.1f ms | %5.1f tok/s avg | graphs %d\n",
+                LOG_COL_BOLD, LOG_COL_DEFAULT, total_tok, total_ms, total_ms > 0 ? 1000.0 * total_tok / total_ms : 0, llama_perf_context(ctx_tgt).n_reused);
 
         const int32_t n_draft_total       = stats.n_draft_tokens;
         const int32_t n_draft_accepted    = stats.n_draft_accepted;
@@ -2295,15 +2279,15 @@ private:
         const auto & cps = slot.prompt.checkpoints;
         float total = 0;
         for (auto & c : cps) total += (float) c.size() / 1024 / 1024;
-        SLT_INF(slot, "%s%s%s | n=%zu/%d total=%.1f MiB n_past=%d", col, action, LOG_COL_DEFAULT, cps.size(), params_base.n_ctx_checkpoints, total, slot.prompt.n_tokens());
+        SLT_INF(slot, "%s%s%s | n=%zu/%d total=%.1f MiB n_past=%d\n", col, action, LOG_COL_DEFAULT, cps.size(), params_base.n_ctx_checkpoints, total, slot.prompt.n_tokens());
         if (cps.empty()) return;
-        SLT_INF(slot, "  %s%3s %7s %7s %12s %8s %5s %6s%s", LOG_COL_BOLD, "#", "n_tok", "MiB", "pos", "hash", "hits", "age", LOG_COL_DEFAULT);
+        SLT_INF(slot, "  %s%3s %7s %7s %12s %8s %5s %6s%s\n", LOG_COL_BOLD, "#", "n_tok", "MiB", "pos", "hash", "hits", "age", LOG_COL_DEFAULT);
         int idx = 0;
         for (auto & c : cps) {
             bool is_hit = hit && c.tok_hash == hit->tok_hash && c.n_tokens == hit->n_tokens;
             const char * row_col = is_hit ? LOG_COL_GREEN : LOG_COL_DEFAULT;
             float age = c.t_created_us ? (ggml_time_us() - c.t_created_us) / 1e6f : 0;
-            SLT_INF(slot, "  %s%3d %7" PRId64 " %7.1f [%5d,%5d] %08x %5" PRIu64 " %5.0fs%s%s", row_col, idx++, c.n_tokens, (float) c.size() / 1024 / 1024, c.pos_min, c.pos_max, (uint32_t) c.tok_hash, c.hits, age, is_hit ? " <-- HIT" : "", LOG_COL_DEFAULT);
+            SLT_INF(slot, "  %s%3d %7" PRId64 " %7.1f [%5d,%5d] %08x %5" PRIu64 " %5.0fs%s%s\n", row_col, idx++, c.n_tokens, (float) c.size() / 1024 / 1024, c.pos_min, c.pos_max, (uint32_t) c.tok_hash, c.hits, age, is_hit ? " <-- HIT" : "", LOG_COL_DEFAULT);
         }
     }
 
@@ -3441,7 +3425,7 @@ private:
                                         {
                                             auto fwd = std::prev(it.base());
                                             float ckpt_mib = (float) fwd->size() / 1024 / 1024;
-                                            SLT_INF(slot, "%sCACHE HIT%s | restored n=%" PRId64 " pos=[%d,%d] hash=%08x %.1f MiB hits=%" PRIu64 " n_past=%d", LOG_COL_GREEN, LOG_COL_DEFAULT, fwd->n_tokens, fwd->pos_min, fwd->pos_max, (uint32_t) fwd->tok_hash, ckpt_mib, fwd->hits, n_past);
+                                            SLT_INF(slot, "%sCACHE HIT%s | restored n=%" PRId64 " pos=[%d,%d] hash=%08x %.1f MiB hits=%" PRIu64 " n_past=%d\n", LOG_COL_GREEN, LOG_COL_DEFAULT, fwd->n_tokens, fwd->pos_min, fwd->pos_max, (uint32_t) fwd->tok_hash, ckpt_mib, fwd->hits, n_past);
                                             log_cache_state(slot, "CACHE STATE", LOG_COL_GREEN, &*fwd);
                                         }
                                         if (use_hash_ckpt) {
@@ -3451,7 +3435,7 @@ private:
                                             slot.prompt.checkpoints.push_back(std::move(ckpt));
                                         }
                                     } else {
-                                        SLT_INF(slot, "%sCACHE MISS%s | no checkpoint for n_past=%d pos_next=%d thold=%d n_ckpt=%zu", LOG_COL_YELLOW, LOG_COL_DEFAULT, n_past, pos_next, pos_min_thold, slot.prompt.checkpoints.size());
+                                        SLT_INF(slot, "%sCACHE MISS%s | no checkpoint for n_past=%d pos_next=%d thold=%d n_ckpt=%zu\n", LOG_COL_YELLOW, LOG_COL_DEFAULT, n_past, pos_next, pos_min_thold, slot.prompt.checkpoints.size());
                                         log_cache_state(slot, "CACHE MISS", LOG_COL_YELLOW, nullptr);
                                         pos_next = 0;
                                         n_past = 0;
