@@ -3532,7 +3532,16 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    slot.mem.seq_rm(slot.id, p0, -1);
+                    auto * mem = llama_get_memory(ctx_tgt);
+                    const auto pmax = mem ? llama_memory_seq_pos_max(mem, slot.id) : -1;
+                    if (pmax >= 0 && p0 <= pmax) {
+                        if (!llama_memory_seq_rm(mem, slot.id, p0, -1)) {
+                            SLT_WRN(slot, "seq_rm [%d,end) failed pmax=%d n_past=%d - keeping cache\n",
+                                    p0, pmax, slot.prompt.n_tokens());
+                        }
+                    } else if (pmax < 0 || p0 != pmax + 1) {
+                        slot.mem.seq_rm(slot.id, p0, -1);
+                    }
 
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
