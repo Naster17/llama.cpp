@@ -1714,7 +1714,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (cur_lcp_len == (int) prompt.tokens.size()) {
-            SRV_INF("pcache: save skip reason=already-stored tok=%d\n", cur_lcp_len);
+            SRV_TRC("pcache: save skip reason=already-stored tok=%d\n", cur_lcp_len);
             return nullptr;
         }
     }
@@ -1739,7 +1739,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
         if (len == (int) it->prompt.tokens.size()) {
-            SRV_INF("pcache: evict reason=contained tok=%d size=%.3fMiB checkpoints=%zu\n",
+            SRV_TRC("pcache: evict reason=contained tok=%d size=%.3fMiB checkpoints=%zu\n",
                     len, it->size() / (1024.0 * 1024.0), it->prompt.checkpoints.size());
 
             it = states.erase(it);
@@ -1751,7 +1751,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
         while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_INF("pcache: evict reason=size tok=%d size=%.3fMiB checkpoints=%zu\n",
+            SRV_TRC("pcache: evict reason=size tok=%d size=%.3fMiB checkpoints=%zu\n",
                     states.front().prompt.n_tokens(), states.front().size() / (1024.0 * 1024.0),
                     states.front().prompt.checkpoints.size());
 
@@ -1790,7 +1790,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         },
     });
 
-    SRV_INF("pcache: save stored tok=%d state=%.3fMiB checkpoints=%zu entries=%zu\n",
+    SRV_TRC("pcache: save stored tok=%d state=%.3fMiB checkpoints=%zu entries=%zu\n",
             prompt.n_tokens(), state_size_new / (1024.0 * 1024.0), prompt.checkpoints.size(), states.size());
 
     return &states.back();
@@ -1871,11 +1871,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         prompt = std::move(it_best->prompt);
 
         states.erase(it_best);
-        SRV_INF("pcache: hit tok=%d lcp=%d keep=%.3f sim=%.3f state=%.3fMiB checkpoints=%zu entries=%zu\n",
+        SRV_TRC("pcache: hit tok=%d lcp=%d keep=%.3f sim=%.3f state=%.3fMiB checkpoints=%zu entries=%zu\n",
                 n_tokens, lcp_best, f_keep_best, f_sim_best, state_size / (1024.0 * 1024.0),
                 n_checkpoints, states.size());
     } else {
-        SRV_INF("pcache: miss request=%zu entries=%zu\n", tokens_new.size(), states.size());
+        SRV_TRC("pcache: miss request=%zu entries=%zu\n", tokens_new.size(), states.size());
     }
 
     return true;
@@ -1884,7 +1884,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 void server_prompt_cache::update() {
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
-            SRV_INF("pcache: evict reason=lru-size tok=%d size=%.3fMiB checkpoints=%zu\n",
+            SRV_TRC("pcache: evict reason=lru-size tok=%d size=%.3fMiB checkpoints=%zu\n",
                     states.front().prompt.n_tokens(), states.front().size() / (1024.0 * 1024.0),
                     states.front().prompt.checkpoints.size());
 
@@ -1900,7 +1900,7 @@ void server_prompt_cache::update() {
 
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            SRV_INF("pcache: evict reason=lru-tokens tok=%d size=%.3fMiB checkpoints=%zu\n",
+            SRV_TRC("pcache: evict reason=lru-tokens tok=%d size=%.3fMiB checkpoints=%zu\n",
                     states.front().prompt.n_tokens(), states.front().size() / (1024.0 * 1024.0),
                     states.front().prompt.checkpoints.size());
 

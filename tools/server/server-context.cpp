@@ -338,7 +338,7 @@ struct server_slot {
             const int64_t t_now = ggml_time_us();
             for (const auto & checkpoint : prompt.checkpoints) {
                 const double age_s = checkpoint.t_created > 0 ? (t_now - checkpoint.t_created) / 1e6 : 0.0;
-                SLT_INF(*this, "ckpt: evict reason=prompt-clear kind=%s tok=%" PRId64 " pos=[%d,%d] size=%.3fMiB age=%.1fs hits=%u\n",
+                SLT_TRC(*this, "ckpt: evict reason=prompt-clear kind=%s tok=%" PRId64 " pos=[%d,%d] size=%.3fMiB age=%.1fs hits=%u\n",
                         checkpoint.is_response ? "response" : "prompt", checkpoint.n_tokens,
                         checkpoint.pos_min, checkpoint.pos_max, checkpoint.size() / (1024.0 * 1024.0),
                         age_s, checkpoint.n_hits);
@@ -623,10 +623,10 @@ struct server_slot {
         t_print_last = t_now;
         n_gen_last = stats.n_gen;
 
-        const char * color = common_log_get_colors() ? LOG_COL_MAGENTA : "";
+        const char * color = common_log_get_colors() ? LOG_COL_GREEN : "";
         const char * reset = common_log_get_colors() ? LOG_COL_DEFAULT : "";
-        SLT_INF(*this, "timing: %sTG%s gen=%d speed=%.2ft/s recent=%.2ft/s elapsed=%.2fs\n",
-                color, reset, (int) stats.n_gen, n_gen_second, n_gen_second_win, stats.t_gen_ms() / 1e3);
+        SLT_INF(*this, "%sTG%s | n_gen=%6d | %6.2f tok/s avg | %6.2f tok/s win\n",
+                color, reset, (int) stats.n_gen, n_gen_second, n_gen_second_win);
     }
 
     void print_timings_pp() const {
@@ -641,7 +641,7 @@ struct server_slot {
 
         const char * color = common_log_get_colors() ? LOG_COL_CYAN : "";
         const char * reset = common_log_get_colors() ? LOG_COL_DEFAULT : "";
-        SLT_INF(*this, "timing: %sPP%s processed=%d/%d progress=%.1f%% speed=%.2ft/s elapsed=%.2fs\n",
+        SLT_INF(*this, "%sPP%s | %6d/%6d tok | %5.1f%% | %6.2f tok/s | %6.1f s\n",
                 color, reset, (int) stats.n_prompt_processed, task->n_tokens(), 100.0 * f_progress,
                 n_prompt_second, t_prompt_total / 1e3);
     }
@@ -655,13 +655,20 @@ struct server_slot {
         const double n_gen_second = stats.n_gen_tps();
         const double t_total = t_prompt_total + t_gen_total;
         const char * pp_color = common_log_get_colors() ? LOG_COL_CYAN : "";
-        const char * tg_color = common_log_get_colors() ? LOG_COL_MAGENTA : "";
+        const char * tg_color = common_log_get_colors() ? LOG_COL_GREEN : "";
+        const char * pf_color = common_log_get_colors() ? LOG_COL_BOLD : "";
         const char * reset    = common_log_get_colors() ? LOG_COL_DEFAULT : "";
 
-        SLT_INF(*this, "timing: cache=%" PRIu64 " %sPP%s=%" PRIu64 "tok %.2ft/s %.2fs %sTG%s=%" PRIu64 "tok %.2ft/s %.2fs total=%.2fs graphs=%d\n",
-                stats.n_prompt_cached, pp_color, reset, stats.n_prompt_processed, n_prompt_second,
-                t_prompt_total / 1e3, tg_color, reset, stats.n_gen, n_gen_second, t_gen_total / 1e3,
-                t_total / 1e3, llama_perf_context(ctx_tgt).n_reused);
+        const uint64_t n_total = stats.n_prompt_processed + stats.n_gen;
+        const double n_total_tps = t_total > 0.0 ? 1e3 * n_total / t_total : 0.0;
+
+        SLT_INF(*this, "%sPP%s %5" PRIu64 " tok | %8.1f ms | %5.1f ms/tok | %6.1f tok/s | cached %" PRIu64 "/%" PRIu64 "\n",
+                pp_color, reset, stats.n_prompt_processed, t_prompt_total, stats.t_prompt_per_token_ms(),
+                n_prompt_second, stats.n_prompt_cached, stats.n_prompt_cached + stats.n_prompt_processed);
+        SLT_INF(*this, "%sTG%s %5" PRIu64 " tok | %8.1f ms | %5.1f ms/tok | %6.1f tok/s\n",
+                tg_color, reset, stats.n_gen, t_gen_total, stats.t_gen_per_token_ms(), n_gen_second);
+        SLT_INF(*this, "%sPERF%s total %5" PRIu64 " tok | %8.1f ms | %6.1f tok/s avg | graphs %d\n",
+                pf_color, reset, n_total, t_total, n_total_tps, llama_perf_context(ctx_tgt).n_reused);
 
         const int32_t n_draft_total       = stats.n_draft_tokens;
         const int32_t n_draft_accepted    = stats.n_draft_accepted;
@@ -2314,13 +2321,32 @@ private:
         const double age_s = checkpoint.t_created > 0 ? (t_now - checkpoint.t_created) / 1e6 : 0.0;
         const double idle_s = checkpoint.t_last_used > 0 ? (t_now - checkpoint.t_last_used) / 1e6 : age_s;
 
-        SLT_INF(slot, "ckpt: %s kind=%s tok=%" PRId64 " pos=[%d,%d] size=%.3fMiB age=%.1fs idle=%.1fs hits=%u\n",
+        SLT_TRC(slot, "ckpt: %s kind=%s tok=%" PRId64 " pos=[%d,%d] size=%.3fMiB age=%.1fs idle=%.1fs hits=%u\n",
                 event, checkpoint_kind(checkpoint), checkpoint.n_tokens, checkpoint.pos_min, checkpoint.pos_max,
                 checkpoint.size() / (1024.0 * 1024.0), age_s, idle_s, checkpoint.n_hits);
     }
 
-    void log_checkpoints(const server_slot & slot) const {
-        if (common_log_get_verbosity_thold() < LOG_LEVEL_INFO) {
+    uint32_t checkpoint_hash(const server_slot & slot, const server_prompt_checkpoint & checkpoint) const {
+        uint32_t hash = 2166136261u;
+        const size_t n_tokens = std::min<size_t>(checkpoint.n_tokens, slot.prompt.tokens.size());
+
+        for (size_t i = 0; i < n_tokens; ++i) {
+            const uint32_t token = slot.prompt.tokens[i];
+            for (int shift = 0; shift < 32; shift += 8) {
+                hash ^= (token >> shift) & 0xff;
+                hash *= 16777619u;
+            }
+        }
+
+        return hash;
+    }
+
+    void log_cache_state(
+            const server_slot & slot,
+            const char * event,
+            const char * color,
+            const server_prompt_checkpoint * checkpoint_hit = nullptr) const {
+        if (params_base.n_ctx_checkpoints <= 0) {
             return;
         }
 
@@ -2329,13 +2355,51 @@ private:
             size += checkpoint.size();
         }
 
-        SLT_INF(slot, "ckpt: inventory count=%zu/%d size=%.3fMiB responses=%d\n",
-                slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, size / (1024.0 * 1024.0),
-                slot.prompt.n_responses);
+        const int64_t t_now = ggml_time_us();
+        const char * bold = common_log_get_colors() ? LOG_COL_BOLD : "";
+        const char * reset = common_log_get_colors() ? LOG_COL_DEFAULT : "";
 
+        SLT_INF(slot, "%s%s%s | n=%zu/%d total=%.1f MiB n_past=%d\n",
+                color, event, reset, slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints,
+                size / (1024.0 * 1024.0), slot.prompt.n_tokens());
+        SLT_INF(slot, "    %s#   n_tok     MiB          pos     hash  hits    age%s\n", bold, reset);
+
+        size_t i = 0;
         for (const auto & checkpoint : slot.prompt.checkpoints) {
-            log_checkpoint(slot, checkpoint, "stored");
+            const double age_s = checkpoint.t_created > 0 ? (t_now - checkpoint.t_created) / 1e6 : 0.0;
+            const char * hit = &checkpoint == checkpoint_hit ? " <-- HIT" : "";
+            SLT_INF(slot, "  %3zu %7" PRId64 " %7.1f [%5d,%5d] %08x %5u %6.0fs%s\n",
+                    i++, checkpoint.n_tokens, checkpoint.size() / (1024.0 * 1024.0),
+                    checkpoint.pos_min, checkpoint.pos_max, (unsigned int) checkpoint_hash(slot, checkpoint),
+                    (unsigned int) checkpoint.n_hits, age_s, hit);
         }
+    }
+
+    void log_cache_hit(const server_slot & slot, const server_prompt_checkpoint & checkpoint, int n_past) const {
+        if (params_base.n_ctx_checkpoints <= 0) {
+            return;
+        }
+
+        const char * color = common_log_get_colors() ? LOG_COL_GREEN : "";
+        const char * reset = common_log_get_colors() ? LOG_COL_DEFAULT : "";
+
+        SLT_INF(slot, "%sCACHE HIT%s | restored n=%" PRId64 " pos=[%d,%d] hash=%08x %.1f MiB hits=%u n_past=%d\n",
+                color, reset, checkpoint.n_tokens, checkpoint.pos_min, checkpoint.pos_max,
+                (unsigned int) checkpoint_hash(slot, checkpoint), checkpoint.size() / (1024.0 * 1024.0),
+                (unsigned int) checkpoint.n_hits, n_past);
+        log_cache_state(slot, "CACHE STATE", color, &checkpoint);
+    }
+
+    void log_cache_miss(const server_slot & slot, const char * reason) const {
+        if (params_base.n_ctx_checkpoints <= 0) {
+            return;
+        }
+
+        const char * color = common_log_get_colors() ? LOG_COL_YELLOW : "";
+        const char * reset = common_log_get_colors() ? LOG_COL_DEFAULT : "";
+
+        SLT_INF(slot, "%sCACHE MISS%s | %s\n", color, reset, reason);
+        log_cache_state(slot, "CACHE MISS", color);
     }
 
     void clear_checkpoints(server_slot & slot, const char * reason) {
@@ -2345,7 +2409,7 @@ private:
 
         slot.prompt.checkpoints.clear();
         slot.prompt.n_responses = 0;
-        SLT_INF(slot, "ckpt: inventory count=0/%d size=0.000MiB responses=0\n", params_base.n_ctx_checkpoints);
+        SLT_TRC(slot, "ckpt: inventory count=0/%d size=0.000MiB responses=0\n", params_base.n_ctx_checkpoints);
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
@@ -2409,7 +2473,7 @@ private:
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
         log_checkpoint(slot, cur, "create");
-        log_checkpoints(slot);
+        log_cache_state(slot, "CACHE SAVE", common_log_get_colors() ? LOG_COL_CYAN : "");
     }
 
     void maybe_create_response_checkpoint(server_slot & slot) {
@@ -2429,7 +2493,7 @@ private:
 
         slot.prompt.n_responses++;
         if (slot.prompt.n_responses % every != 0) {
-            SLT_INF(slot, "ckpt: skip kind=response response=%d every=%d\n", slot.prompt.n_responses, every);
+            SLT_TRC(slot, "ckpt: skip kind=response response=%d every=%d\n", slot.prompt.n_responses, every);
             return;
         }
 
@@ -3234,6 +3298,10 @@ private:
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
                         bool has_common_prefix = false;
+                        bool cache_restored = false;
+                        bool checkpoint_miss = false;
+                        int checkpoint_pos_next = 0;
+                        int checkpoint_threshold = 0;
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -3451,13 +3519,14 @@ private:
                                         checkpoint.n_hits++;
                                         checkpoint.t_last_used = ggml_time_us();
                                         log_checkpoint(slot, checkpoint, "hit restore");
-                                        SLT_INF(slot, "ckpt: restore past=%d next=%d threshold=%d\n", n_past, pos_next, pos_min_thold);
-                                        log_checkpoints(slot);
+                                        log_cache_hit(slot, checkpoint, n_past);
+                                        cache_restored = true;
                                     }
 
                                     if (do_reset) {
-                                        SLT_INF(slot, "ckpt: miss action=full-reprocess next=%d threshold=%d retained=%zu\n",
-                                                pos_next, pos_min_thold, slot.prompt.checkpoints.size());
+                                        checkpoint_miss = true;
+                                        checkpoint_pos_next = pos_next;
+                                        checkpoint_threshold = pos_min_thold;
                                         pos_next = 0;
                                         n_past = 0;
                                     }
@@ -3490,10 +3559,19 @@ private:
 
                         metrics.add_prompt_cached(n_past);
 
-                        if (n_past > 0) {
-                            SLT_INF(slot, "cache: hit source=live-kv cached=%d request=%d\n", n_past, slot.task->n_tokens());
-                        } else {
-                            SLT_INF(slot, "cache: miss source=live-kv request=%d\n", slot.task->n_tokens());
+                        if (params_base.n_ctx_checkpoints > 0 && !cache_restored && n_past > 0) {
+                            const char * color = common_log_get_colors() ? LOG_COL_GREEN : "";
+                            const char * reset = common_log_get_colors() ? LOG_COL_DEFAULT : "";
+                            SLT_INF(slot, "%sCACHE HIT%s | live KV cached=%d/%d\n",
+                                    color, reset, n_past, slot.task->n_tokens());
+                            log_cache_state(slot, "CACHE STATE", color);
+                        } else if (params_base.n_ctx_checkpoints > 0 && !cache_restored && checkpoint_miss) {
+                            const auto reason = string_format("no checkpoint for pos_next=%d threshold=%d n_ckpt=%zu",
+                                    checkpoint_pos_next, checkpoint_threshold, slot.prompt.checkpoints.size());
+                            log_cache_miss(slot, reason.c_str());
+                        } else if (params_base.n_ctx_checkpoints > 0 && !cache_restored) {
+                            const auto reason = string_format("no cached prefix for request=%d", slot.task->n_tokens());
+                            log_cache_miss(slot, reason.c_str());
                         }
 
                         if (!has_common_prefix) {
