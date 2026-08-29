@@ -2267,6 +2267,8 @@ void common_prompt_checkpoint::clear() {
     pos_max = 0;
 
     tok_hash = 0;
+    hits = 0;
+    t_created_us = 0;
 
     data_tgt.clear();
     data_dft.clear();

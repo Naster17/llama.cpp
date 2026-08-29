@@ -1172,6 +1172,9 @@ struct common_prompt_checkpoint {
 
     uint64_t tok_hash = 0;
 
+    uint64_t hits = 0;
+    int64_t  t_created_us = 0;
+
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
 

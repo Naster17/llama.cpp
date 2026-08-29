@@ -2288,6 +2288,25 @@ private:
         return h == 0 ? 1 : h;
     }
 
+    void log_cache_state(const server_slot & slot, const char * action, const char * col, const common_prompt_checkpoint * hit = nullptr) const {
+        if (common_log_get_verbosity_thold() < LOG_LEVEL_INFO) {
+            return;
+        }
+        const auto & cps = slot.prompt.checkpoints;
+        float total = 0;
+        for (auto & c : cps) total += (float) c.size() / 1024 / 1024;
+        SLT_INF(slot, "%s%s%s | n=%zu/%d total=%.1f MiB n_past=%d", col, action, LOG_COL_DEFAULT, cps.size(), params_base.n_ctx_checkpoints, total, slot.prompt.n_tokens());
+        if (cps.empty()) return;
+        SLT_INF(slot, "  %s%3s %7s %7s %12s %8s %5s %6s%s", LOG_COL_BOLD, "#", "n_tok", "MiB", "pos", "hash", "hits", "age", LOG_COL_DEFAULT);
+        int idx = 0;
+        for (auto & c : cps) {
+            bool is_hit = hit && c.tok_hash == hit->tok_hash && c.n_tokens == hit->n_tokens;
+            const char * row_col = is_hit ? LOG_COL_GREEN : LOG_COL_DEFAULT;
+            float age = c.t_created_us ? (ggml_time_us() - c.t_created_us) / 1e6f : 0;
+            SLT_INF(slot, "  %s%3d %7" PRId64 " %7.1f [%5d,%5d] %08x %5" PRIu64 " %5.0fs%s%s", row_col, idx++, c.n_tokens, (float) c.size() / 1024 / 1024, c.pos_min, c.pos_max, (uint32_t) c.tok_hash, c.hits, age, is_hit ? " <-- HIT" : "", LOG_COL_DEFAULT);
+        }
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
@@ -2325,12 +2344,8 @@ private:
         }
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
             const auto & cur = slot.prompt.checkpoints.front();
-
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
-
+            SLT_INF(slot, "%sCACHE EVICT%s | erasing oldest (pos=[%d,%d] n=%" PRId64 " hash=%08x %.1f MiB) cap=%d\n", LOG_COL_RED, LOG_COL_DEFAULT, cur.pos_min, cur.pos_max, cur.n_tokens, (uint32_t) cur.tok_hash, (float) cur.size() / 1024 / 1024, params_base.n_ctx_checkpoints);
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
@@ -2343,16 +2358,15 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(new_n_tokens, pos_min, pos_max);
         cur.tok_hash = new_hash;
+        cur.hits = 0;
+        cur.t_created_us = ggml_time_us();
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
-        SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+        log_cache_state(slot, "CACHE SAVE", LOG_COL_CYAN, nullptr);
     }
 
     // create a context checkpoint after a completed response, when --cache-after-resp is enabled.
@@ -2390,10 +2404,6 @@ private:
 
         // the final sampled token is not yet in the KV cache, so it is excluded from the checkpoint
         create_checkpoint(slot, /*n_tokens_cur =*/ 1, pos_min, pos_max);
-
-        SLT_INF(slot, "context checkpoint saved after response #%d (every %d): %d of %d retained, n_tokens = %" PRId64 "\n",
-                slot.n_responses, every, (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints,
-                (int64_t) (slot.prompt.n_tokens() - 1));
     }
 
     // returns false to decline the task, it is offered again after the decode is done
@@ -3409,12 +3419,13 @@ private:
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
                                     if (!do_reset) {
-                                        // restore the context checkpoint
+                                        {
+                                            auto fwd = std::prev(it.base());
+                                            fwd->hits++;
+                                        }
                                         it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
-
                                         if (use_hash_ckpt) {
                                             {
                                                 server_tokens tmp = input_tokens.clone();
@@ -3427,22 +3438,21 @@ private:
                                             pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                             n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                         }
-
-                                        if (params_base.cache_after_resp) {
-                                            SLT_INF(slot, "restored context checkpoint from previous response (n_tokens = %" PRId64 " hash = %016" PRIx64 ")\n", it->n_tokens, it->tok_hash);
+                                        {
+                                            auto fwd = std::prev(it.base());
+                                            float ckpt_mib = (float) fwd->size() / 1024 / 1024;
+                                            SLT_INF(slot, "%sCACHE HIT%s | restored n=%" PRId64 " pos=[%d,%d] hash=%08x %.1f MiB hits=%" PRIu64 " n_past=%d", LOG_COL_GREEN, LOG_COL_DEFAULT, fwd->n_tokens, fwd->pos_min, fwd->pos_max, (uint32_t) fwd->tok_hash, ckpt_mib, fwd->hits, n_past);
+                                            log_cache_state(slot, "CACHE STATE", LOG_COL_GREEN, &*fwd);
                                         }
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                         if (use_hash_ckpt) {
                                             auto fwd = std::prev(it.base());
                                             auto ckpt = std::move(*fwd);
                                             slot.prompt.checkpoints.erase(fwd);
                                             slot.prompt.checkpoints.push_back(std::move(ckpt));
                                         }
-                                    }
-
-                                    if (do_reset) {
-                                        SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
-                                                "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
+                                    } else {
+                                        SLT_INF(slot, "%sCACHE MISS%s | no checkpoint for n_past=%d pos_next=%d thold=%d n_ckpt=%zu", LOG_COL_YELLOW, LOG_COL_DEFAULT, n_past, pos_next, pos_min_thold, slot.prompt.checkpoints.size());
+                                        log_cache_state(slot, "CACHE MISS", LOG_COL_YELLOW, nullptr);
                                         pos_next = 0;
                                         n_past = 0;
                                     }
