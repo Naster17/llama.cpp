@@ -917,6 +917,28 @@ extern "C" {
 
     typedef uint32_t llama_state_seq_flags;
 
+    struct llama_state_seq_device;
+
+    // Create an opaque state snapshot that keeps tensor data in backend buffers.
+    // The snapshot is valid only for contexts with compatible backend layouts.
+    LLAMA_API struct llama_state_seq_device * llama_state_seq_device_create(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+           llama_state_seq_flags   flags);
+
+    // Return the total host and backend storage used by a device state snapshot.
+    LLAMA_API size_t llama_state_seq_device_size(const struct llama_state_seq_device * state);
+
+    // Restore an opaque device state snapshot into the specified sequence.
+    LLAMA_API bool llama_state_seq_device_restore(
+            struct llama_context *                     ctx,
+            const struct llama_state_seq_device *     state,
+                             llama_seq_id              dest_seq_id,
+                    llama_state_seq_flags              flags);
+
+    // Release an opaque device state snapshot.
+    LLAMA_API void llama_state_seq_device_free(struct llama_state_seq_device * state);
+
     LLAMA_API size_t llama_state_seq_get_size_ext(
             struct llama_context * ctx,
                     llama_seq_id   seq_id,

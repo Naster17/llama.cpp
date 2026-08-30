@@ -9,6 +9,7 @@
 #include "llama.h"
 
 #include <list>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
@@ -631,6 +632,7 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t n_cache_after_resp  = 0;     // checkpoint every N completed responses; 0 = disabled
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    bool    cache_device        = false; // keep server cache states in backend buffers
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
@@ -1174,6 +1176,9 @@ struct common_prompt_checkpoint {
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
 
+    std::shared_ptr<struct llama_state_seq_device> data_tgt_device;
+    std::shared_ptr<struct llama_state_seq_device> data_dft_device;
+
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
@@ -1198,12 +1203,32 @@ struct common_prompt_checkpoint {
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
+    bool update_tgt_device(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags);
+
+    bool update_dft_device(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags);
+
     void load_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
 
     void load_dft(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags) const;
+
+    bool load_tgt_device(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags) const;
+
+    bool load_dft_device(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;

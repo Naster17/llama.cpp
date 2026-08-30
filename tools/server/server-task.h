@@ -600,8 +600,13 @@ struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;
 
+    std::shared_ptr<struct llama_state_seq_device> main_device;
+    std::shared_ptr<struct llama_state_seq_device> drft_device;
+
     size_t size() const {
-        return main.size() + drft.size();
+        return main.size() + drft.size() +
+            llama_state_seq_device_size(main_device.get()) +
+            llama_state_seq_device_size(drft_device.get());
     }
 };
 

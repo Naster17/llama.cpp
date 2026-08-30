@@ -296,7 +296,7 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
+    bool prompt_save(server_prompt_cache & prompt_cache, bool cache_device) const {
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -312,6 +312,24 @@ struct server_slot {
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
             return false;
+        }
+
+        if (cache_device) {
+            cur->data.main_device.reset(llama_state_seq_device_create(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE), llama_state_seq_device_free);
+            if (ctx_dft) {
+                cur->data.drft_device.reset(llama_state_seq_device_create(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE), llama_state_seq_device_free);
+            }
+            if (cur->data.main_device && (!ctx_dft || cur->data.drft_device)) {
+                cur->data.main.clear();
+                cur->data.drft.clear();
+                cur->data.main.shrink_to_fit();
+                cur->data.drft.shrink_to_fit();
+                return true;
+            }
+
+            cur->data.main_device.reset();
+            cur->data.drft_device.reset();
+            SRV_WRN("%s", "pcache: device state save failed, using host state\n");
         }
 
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
@@ -1383,6 +1401,9 @@ private:
             if (params_base.n_cache_after_resp > 0) {
                 SRV_INF("response checkpoints enabled, every %d completed responses\n", params_base.n_cache_after_resp);
             }
+            if (params_base.cache_device) {
+                SRV_INF("%s", "response checkpoints and prompt-cache states will use backend buffers\n");
+            }
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
         }
@@ -1654,7 +1675,7 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                ret->prompt_save(*prompt_cache, params_base.cache_device);
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
@@ -2425,7 +2446,7 @@ private:
         }
     }
 
-    void log_cache_hit(const server_slot & slot, const server_prompt_checkpoint & checkpoint, int n_past) const {
+    void log_cache_hit(const server_slot & slot, const server_prompt_checkpoint & checkpoint, int n_past, int64_t t_restore_us) const {
         if (params_base.n_ctx_checkpoints <= 0) {
             return;
         }
@@ -2433,10 +2454,12 @@ private:
         const char * color = common_log_get_colors() ? LOG_COL_GREEN : "";
         const char * reset = common_log_get_colors() ? LOG_COL_DEFAULT : "";
 
-        SLT_INF(slot, "%sCACHE HIT%s | restored n=%" PRId64 " pos=[%d,%d] hash=%08x %.1f MiB hits=%u n_past=%d\n",
+        const double t_restore_ms = t_restore_us / 1000.0;
+        const double rate_mib_s = t_restore_us > 0 ? checkpoint.size() * 1e6 / t_restore_us / (1024.0 * 1024.0) : 0.0;
+        SLT_INF(slot, "%sCACHE HIT%s | restored n=%" PRId64 " pos=[%d,%d] hash=%08x %s %.1f MiB %.1f ms %.1f MiB/s hits=%u n_past=%d\n",
                 color, reset, checkpoint.n_tokens, checkpoint.pos_min, checkpoint.pos_max,
-                (unsigned int) checkpoint_hash(slot, checkpoint), checkpoint.size() / (1024.0 * 1024.0),
-                (unsigned int) checkpoint.n_hits, n_past);
+                (unsigned int) checkpoint_hash(slot, checkpoint), checkpoint.data_tgt_device ? "device" : "host", checkpoint.size() / (1024.0 * 1024.0),
+                t_restore_ms, rate_mib_s, (unsigned int) checkpoint.n_hits, n_past);
         log_cache_state(slot, "CACHE STATE", color, &checkpoint);
     }
 
@@ -2463,7 +2486,7 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool is_response = false) {
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool is_response = false, bool use_device = false) {
         const int id_task = slot.task->id;
         const int n_response_checkpoints_max = std::min(3, params_base.n_ctx_checkpoints);
 
@@ -2542,12 +2565,28 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        const int64_t t_save_start = ggml_time_us();
+        use_device = params_base.cache_device && (is_response || use_device);
+        if (use_device) {
+            if (!cur.update_tgt_device(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) ||
+                    !cur.update_dft_device(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
+                slot.prompt.checkpoints.pop_back();
+                SLT_WRN(slot, "%s", "failed to create device checkpoint\n");
+                return;
+            }
+        } else {
+            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
+        const int64_t t_save_us = ggml_time_us() - t_save_start;
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
         log_checkpoint(slot, cur, "create");
+        const double t_save_ms = t_save_us / 1000.0;
+        const double rate_mib_s = t_save_us > 0 ? cur.size() * 1e6 / t_save_us / (1024.0 * 1024.0) : 0.0;
+        SLT_INF(slot, "CHECKPOINT SAVE | %s %s %.1f MiB %.1f ms %.1f MiB/s\n",
+                checkpoint_kind(cur), use_device ? "device" : "host", cur.size() / (1024.0 * 1024.0), t_save_ms, rate_mib_s);
         log_cache_state(slot, "CACHE SAVE", common_log_get_colors() ? LOG_COL_CYAN : "");
     }
 
@@ -2648,7 +2687,7 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                if (slot.prompt_save(*prompt_cache)) {
+                                if (slot.prompt_save(*prompt_cache, params_base.cache_device)) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
                                 }
@@ -3583,19 +3622,29 @@ private:
 
                                     if (!do_reset) {
                                         // restore the context checkpoint
-                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        // restore the draft's speculative state
-                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+                                        const int64_t t_restore_start = ggml_time_us();
+                                        const bool restored = it->data_tgt_device
+                                            ? it->load_tgt_device(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) &&
+                                                it->load_dft_device(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)
+                                            : (it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY),
+                                                it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY), true);
+                                        const int64_t t_restore_us = ggml_time_us() - t_restore_start;
+                                        if (!restored) {
+                                            do_reset = true;
+                                        }
+                                        if (restored) {
+                                            // restore the draft's speculative state
+                                            common_speculative_set_state(spec.get(), slot.id, it->data_spec);
 
-                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        auto & checkpoint = *std::prev(it.base());
-                                        checkpoint.n_hits++;
-                                        checkpoint.t_last_used = ggml_time_us();
-                                        log_checkpoint(slot, checkpoint, "hit restore");
-                                        log_cache_hit(slot, checkpoint, n_past);
-                                        cache_restored = true;
+                                            pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                            n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                            auto & checkpoint = *std::prev(it.base());
+                                            checkpoint.n_hits++;
+                                            checkpoint.t_last_used = ggml_time_us();
+                                            log_checkpoint(slot, checkpoint, "hit restore");
+                                            log_cache_hit(slot, checkpoint, n_past, t_restore_us);
+                                            cache_restored = true;
+                                        }
                                     }
 
                                     if (do_reset) {
@@ -3899,7 +3948,7 @@ private:
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max, is_response_checkpoint);
+                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max, is_response_checkpoint, near_prompt_end);
                     }
                 }
 

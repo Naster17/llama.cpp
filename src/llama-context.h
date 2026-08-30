@@ -39,6 +39,19 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+struct llama_state_seq_device {
+    std::vector<uint8_t> data;
+    llama_memory_buffers buffers;
+
+    size_t size() const {
+        size_t result = data.size();
+        for (const auto & [_, buffer] : buffers) {
+            result += buffer.total_size;
+        }
+        return result;
+    }
+};
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -155,6 +168,9 @@ struct llama_context {
 
     size_t state_seq_get_data(llama_seq_id seq_id,       uint8_t * dst, size_t size, llama_state_seq_flags flags);
     size_t state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags);
+
+    struct llama_state_seq_device * state_seq_device_create(llama_seq_id seq_id, llama_state_seq_flags flags);
+    bool state_seq_device_restore(const struct llama_state_seq_device & state, llama_seq_id seq_id, llama_state_seq_flags flags);
 
     bool state_load_file(
             const char * filepath,

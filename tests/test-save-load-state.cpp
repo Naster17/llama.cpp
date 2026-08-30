@@ -354,8 +354,61 @@ static bool test_seq_cp_device(struct llama_model * model, const struct common_p
     return true;
 }
 
+// Test 6: independent device state snapshot
+// - save a sequence state to an opaque device snapshot
+// - clear the KV cache and restore to another sequence
+// - verify that generation is unchanged
+static bool test_seq_device_snapshot(struct llama_model * model, const struct common_params & params, const llama_tokens & tokens, const llama_tokens & expected_result) {
+    auto params_ctx = common_context_params_to_llama(params);
+    params_ctx.n_seq_max = 2;
+    auto ctx = llama_context_ptr{llama_init_from_model(model, params_ctx)};
 
-// Run the full save/load test suite (tests 1-5) for a single model.
+    auto sparams = llama_sampler_chain_default_params();
+    auto smpl = llama_sampler_ptr{llama_sampler_chain_init(sparams)};
+    llama_sampler_chain_add(smpl.get(), llama_sampler_init_dist(params.sampling.seed));
+
+    LOG("\n=== Test 6: independent device state snapshot ===\n");
+
+    llama_tokens unused_sts(tokens.size());
+    size_t n_token_count_out = 0;
+    if (!llama_state_load_file(ctx.get(), params.out_file.data(), unused_sts.data(), unused_sts.size(), &n_token_count_out)) {
+        LOG_ERR("\n%s: failed to load state\n", __func__);
+        return false;
+    }
+
+    int n_past = (int) n_token_count_out - 1;
+    if (!common_replay_last_token(ctx.get(), tokens.back(), n_past)) {
+        return false;
+    }
+    n_past++;
+
+    auto * state = llama_state_seq_device_create(ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_NONE);
+    if (state == nullptr || llama_state_seq_device_size(state) == 0) {
+        LOG_ERR("\n%s: failed to create device state\n", __func__);
+        llama_state_seq_device_free(state);
+        return false;
+    }
+
+    llama_memory_clear(llama_get_memory(ctx.get()), true);
+    const bool restored = llama_state_seq_device_restore(ctx.get(), state, 1, LLAMA_STATE_SEQ_FLAGS_NONE);
+    llama_state_seq_device_free(state);
+    if (!restored) {
+        LOG_ERR("\n%s: failed to restore device state\n", __func__);
+        return false;
+    }
+
+    auto result = generate_tokens(ctx.get(), smpl.get(), n_past, params.n_predict, 1);
+    if (result.empty() || result != expected_result) {
+        LOG_ERR("\n%s: generation differs from expected\n", __func__);
+        return false;
+    }
+
+    LOG("\nPASS\n");
+    return true;
+}
+
+
+// Run the full save/load test suite (tests 1-6) for a single model.
 // Returns true if all tests pass, false otherwise.
 static bool run_save_load_tests_for_model(const std::string & model_path, const struct common_params & base_params) {
     struct common_params params = base_params;
@@ -419,6 +472,11 @@ static bool run_save_load_tests_for_model(const std::string & model_path, const 
 
     // Test 5: seq copy (device)
     if (!test_seq_cp_device(model, params, tokens, result_baseline)) {
+        return false;
+    }
+
+    // Test 6: independent device state snapshot
+    if (!test_seq_device_snapshot(model, params, tokens, result_baseline)) {
         return false;
     }
 

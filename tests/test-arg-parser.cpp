@@ -288,6 +288,13 @@ static void test(void) {
     }
 
     {
+        common_params cache_params;
+        argv = {"binary_name", "--cache-device"};
+        assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_params, LLAMA_EXAMPLE_SERVER));
+        assert(cache_params.cache_device);
+    }
+
+    {
         common_params synth_params;
         argv = {"binary_name", "--spec-synth-len", "3.4x"};
         assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), synth_params, LLAMA_EXAMPLE_SERVER));

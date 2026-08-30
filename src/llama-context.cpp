@@ -3120,6 +3120,51 @@ size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * sr
     }
 }
 
+struct llama_state_seq_device * llama_context::state_seq_device_create(llama_seq_id seq_id, llama_state_seq_flags flags) {
+    flags |= LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+
+    try {
+        auto result = std::make_unique<struct llama_state_seq_device>();
+        result->data.resize(state_seq_get_size(seq_id, flags));
+
+        {
+            llama_io_write_device io(result->data.data(), result->data.size(), result->buffers);
+            io.write(&io_magic, sizeof(io_magic));
+            io.write(&seq_id, sizeof(seq_id));
+            state_seq_write_data(io, seq_id, flags);
+        }
+
+        return result.release();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving device state: %s\n", __func__, err.what());
+        return nullptr;
+    }
+}
+
+bool llama_context::state_seq_device_restore(const struct llama_state_seq_device & state, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    flags |= LLAMA_STATE_SEQ_FLAGS_ON_DEVICE;
+
+    try {
+        llama_io_read_device io(state.data.data(), state.data.size(), state.buffers);
+
+        uint32_t magic_read;
+        io.read(&magic_read, sizeof(magic_read));
+        if (io_magic != magic_read) {
+            throw std::runtime_error("wrong sequence state magic");
+        }
+
+        llama_seq_id seq_id_read;
+        io.read(&seq_id_read, sizeof(seq_id_read));
+        GGML_UNUSED(seq_id_read);
+
+        state_seq_read_data(io, seq_id, flags);
+        return true;
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error loading device state: %s\n", __func__, err.what());
+        return false;
+    }
+}
+
 bool llama_context::state_load_file(const char * filepath, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
     llama_file file(filepath, "rb");
 
@@ -4161,6 +4206,32 @@ size_t llama_state_seq_set_data(llama_context * ctx, const uint8_t * src, size_t
 
 size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) {
     return ctx->state_seq_get_size(seq_id, flags);
+}
+
+struct llama_state_seq_device * llama_state_seq_device_create(llama_context * ctx, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    ctx->synchronize();
+    return ctx->state_seq_device_create(seq_id, flags);
+}
+
+size_t llama_state_seq_device_size(const struct llama_state_seq_device * state) {
+    return state ? state->size() : 0;
+}
+
+bool llama_state_seq_device_restore(
+        llama_context * ctx,
+        const struct llama_state_seq_device * state,
+        llama_seq_id dest_seq_id,
+        llama_state_seq_flags flags) {
+    if (state == nullptr) {
+        return false;
+    }
+
+    ctx->synchronize();
+    return ctx->state_seq_device_restore(*state, dest_seq_id, flags);
+}
+
+void llama_state_seq_device_free(struct llama_state_seq_device * state) {
+    delete state;
 }
 
 size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
