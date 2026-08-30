@@ -179,6 +179,26 @@ struct common_chat_msg_spans {
         return false;
     }
 
+    bool is_assistant_response_end(int32_t pos) const {
+        for (auto it = spans.begin(); it != spans.end(); ++it) {
+            if (it->role == COMMON_CHAT_ROLE_USER && pos == (int32_t) it->pos) {
+                return it != spans.begin() && std::prev(it)->role == COMMON_CHAT_ROLE_ASSISTANT;
+            }
+        }
+        return false;
+    }
+
+    int32_t count_assistant_response_ends_from(int32_t pos) const {
+        int32_t result = 0;
+        for (auto it = spans.begin(); it != spans.end(); ++it) {
+            if (it->role == COMMON_CHAT_ROLE_USER && (int32_t) it->pos >= pos &&
+                    it != spans.begin() && std::prev(it)->role == COMMON_CHAT_ROLE_ASSISTANT) {
+                result++;
+            }
+        }
+        return result;
+    }
+
     int32_t last_user_message_pos() const {
         for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
             if (it->role == COMMON_CHAT_ROLE_USER) {

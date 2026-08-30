@@ -2465,6 +2465,7 @@ private:
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool is_response = false) {
         const int id_task = slot.task->id;
+        const int n_response_checkpoints_max = std::min(3, params_base.n_ctx_checkpoints);
 
         if (!is_response && params_base.n_cache_after_resp <= 0) {
             // Response checkpoints deliberately follow short responses, so do not evict them
@@ -2488,13 +2489,37 @@ private:
             }
         }
 
+        while (is_response && std::count_if(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(), [](const auto & checkpoint) {
+            return checkpoint.is_response;
+        }) >= n_response_checkpoints_max) {
+            auto it = std::min_element(
+                    slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                    [](const auto & a, const auto & b) {
+                        if (a.is_response != b.is_response) {
+                            return a.is_response;
+                        }
+                        return a.t_created < b.t_created;
+                    });
+            log_checkpoint(slot, *it, "evict reason=response-cap");
+            slot.prompt.checkpoints.erase(it);
+        }
+
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            auto it = slot.prompt.checkpoints.begin();
+            auto it = std::find_if(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(), [](const auto & checkpoint) {
+                return !checkpoint.is_response;
+            });
+            if (it == slot.prompt.checkpoints.end()) {
+                SLT_TRC(slot, "%s", "ckpt: skip kind=prompt reason=response-reserve\n");
+                return;
+            }
             if (params_base.n_cache_after_resp > 0) {
                 it = std::min_element(
                         slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
                         [](const auto & a, const auto & b) {
+                            if (a.is_response != b.is_response) {
+                                return !a.is_response;
+                            }
                             return a.t_last_used < b.t_last_used;
                         });
             }
@@ -3774,12 +3799,18 @@ private:
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
 
-                        // break at the last user message, or at user messages at least min step past the last checkpoint
-                        if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
+                        const bool is_response_checkpoint = params_base.n_cache_after_resp > 0 &&
+                            spans.is_assistant_response_end(slot.prompt.n_tokens()) &&
+                            spans.count_assistant_response_ends_from(slot.prompt.n_tokens()) <= 3;
+
+                        // Break before the last three assistant responses that precede a user message.
+                        if (do_checkpoint && (params_base.n_cache_after_resp > 0
+                                ? is_response_checkpoint
+                                : spans.is_user_start(slot.prompt.n_tokens()))) {
                             const auto pos = slot.prompt.n_tokens();
                             const auto & checkpoints = slot.prompt.checkpoints;
 
-                            if (pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
+                            if (params_base.n_cache_after_resp > 0 || pos == last_user_pos || checkpoints.empty() || pos > checkpoints.back().n_tokens + params_base.checkpoint_min_step) {
                                 break;
                             }
                         }
@@ -3813,8 +3844,17 @@ private:
 
                     const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
 
-                    const bool is_user_start = spans.is_user_start(n_tokens_start);
+                    const bool is_user_start = params_base.n_cache_after_resp <= 0 && spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
+                    const bool is_response_checkpoint = params_base.n_cache_after_resp > 0 &&
+                        spans.is_assistant_response_end(n_tokens_start) &&
+                        spans.count_assistant_response_ends_from(n_tokens_start) <= 3;
+                    const bool is_checkpoint_boundary = params_base.n_cache_after_resp > 0
+                        ? is_response_checkpoint
+                        : is_user_start;
+                    const bool is_priority_checkpoint = params_base.n_cache_after_resp > 0
+                        ? is_response_checkpoint
+                        : is_last_user_message;
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
@@ -3830,9 +3870,9 @@ private:
 
                         slot.init_sampler();
                     } else {
-                        // skip ordinary mid-prompt checkpoints, unless the batch starts a user
+                        // skip ordinary mid-prompt checkpoints, unless the batch starts a checkpoint boundary
                         // message or we are near the end of the prompt
-                        if (!is_user_start && !near_prompt_end) {
+                        if (!is_checkpoint_boundary && !near_prompt_end) {
                             do_checkpoint = false;
                         }
                     }
@@ -3849,17 +3889,17 @@ private:
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
-                    // no need to create checkpoints that are too close together, unless it's the last user message
+                    // no need to create checkpoints that are too close together, unless it is a priority checkpoint
                     do_checkpoint = do_checkpoint && (
                             slot.prompt.checkpoints.empty() ||
-                            is_last_user_message || near_prompt_end ||
+                            is_priority_checkpoint || near_prompt_end ||
                             n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max, is_response_checkpoint);
                     }
                 }
 
