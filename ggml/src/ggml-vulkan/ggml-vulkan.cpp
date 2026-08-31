@@ -3777,6 +3777,10 @@ static vk_fa_tuning_params get_fa_tuning_params_scalar(const vk_device& device, 
     }
     result.row_split = (n_rows < 4 || hsk <= row_split_max_hsk) ? 1 : 4;
 
+    if (device->vendor_id == VK_VENDOR_ID_AMD && device->uma && !device->integer_dot_product && hsk == 256 && hsv == 256 && n_rows >= 64) {
+        result.row_split = 1;
+    }
+
     if (result.subgroup_size > 32 && (n_rows < 4 || hsk < (result.row_split == 1 ? 128 : 64))) {
         result.workgroup_size = result.subgroup_size * 2;
     } else {
