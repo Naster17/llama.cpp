@@ -112,6 +112,13 @@ if (Vulkan_FOUND)
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
     target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
+    # GCC 16 emits a false-positive -Wnonnull inside vector::assign in the SPIR-V
+    # patching helpers (freshly allocated buffer reported as null). The diagnostic
+    # points into libstdc++ internals, so it can only be silenced here.
+    if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 16)
+        target_compile_options(ggml-vulkan PRIVATE -Wno-nonnull)
+    endif()
+
     # Workaround to the "can't dereference invalidated vector iterator" bug in clang-cl debug build
     # Possibly relevant: https://stackoverflow.com/questions/74748276/visual-studio-no-displays-the-correct-length-of-stdvector
     if (MSVC AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
