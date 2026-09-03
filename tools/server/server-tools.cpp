@@ -99,7 +99,16 @@ enum class list_kind {
 // a narrow path uses the active code page on Windows, so every crossing between
 // a std::string (always UTF-8 here) and fs::path is converted explicitly
 static fs::path path_from_utf8(const std::string & s) {
-    return fs::path(reinterpret_cast<const char8_t *>(s.c_str()));
+#ifdef _WIN32
+    // narrow path uses the active code page, so go through UTF-16
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int) s.size(), nullptr, 0);
+    std::wstring w(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int) s.size(), w.data(), n);
+    return fs::path(w);
+#else
+    // narrow native encoding is UTF-8 on POSIX
+    return fs::path(s);
+#endif
 }
 
 // '/' separators on every platform: Windows accepts them, the web UI needs them
