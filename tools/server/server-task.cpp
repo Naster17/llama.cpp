@@ -1708,7 +1708,9 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+// note: checkpoints_size accounts for checkpoints that the caller attaches to the
+// returned state after the call, they are moved (not copied) out of the slot
+server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, size_t checkpoints_size) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
@@ -1717,12 +1719,6 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             SRV_TRC("pcache: save skip reason=already-stored tok=%d\n", cur_lcp_len);
             return nullptr;
         }
-    }
-
-    // calculate checkpoints size to see if it will fit with the prompt
-    size_t checkpoints_size = 0;
-    for (const auto & ckpt : prompt.checkpoints) {
-        checkpoints_size += ckpt.size();
     }
 
     const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
@@ -1781,7 +1777,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
+            /*.checkpoints =*/ {}, // attached by the caller, moving them out of the slot
             /*.n_responses =*/ prompt.n_responses,
         },
         /*.data   =*/ {

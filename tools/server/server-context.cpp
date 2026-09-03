@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <filesystem>
 #include <random>
@@ -296,7 +297,7 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache, bool cache_device) const {
+    bool prompt_save(server_prompt_cache & prompt_cache, bool cache_device, int64_t n_tokens_keep) {
         if (prompt.tokens.size() == 0) {
             return false;
         }
@@ -309,10 +310,26 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        // checkpoints that will not survive the upcoming prompt change are moved into the
+        // cache state instead of being copied, they can be restored from the cache later
+        std::list<server_prompt_checkpoint> moved_checkpoints;
+        size_t moved_size = 0;
+        for (auto it = prompt.checkpoints.begin(); it != prompt.checkpoints.end();) {
+            if (it->n_tokens > n_tokens_keep) {
+                moved_size += it->size();
+                moved_checkpoints.splice(moved_checkpoints.end(), prompt.checkpoints, it++);
+            } else {
+                ++it;
+            }
+        }
+
+        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, moved_size);
         if (cur == nullptr) {
+            prompt.checkpoints.splice(prompt.checkpoints.end(), moved_checkpoints);
             return false;
         }
+
+        cur->prompt.checkpoints.splice(cur->prompt.checkpoints.end(), moved_checkpoints);
 
         if (cache_device) {
             cur->data.main_device.reset(llama_state_seq_device_create(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE), llama_state_seq_device_free);
@@ -655,12 +672,13 @@ struct server_slot {
         }
 
         const double n_prompt_second = stats.n_prompt_tps();
-        const double f_progress = task->n_tokens() > 0 ? (double) prompt.n_tokens() / task->n_tokens() : 0.0;
+        const uint64_t n_prompt_total = std::max<uint64_t>(1, task->n_tokens() - stats.n_prompt_cached);
+        const double f_progress = (double) stats.n_prompt_processed / n_prompt_total;
 
         const char * color = common_log_get_colors() ? LOG_COL_CYAN : "";
         const char * reset = common_log_get_colors() ? LOG_COL_DEFAULT : "";
         SLT_INF(*this, "%sPP%s | %6d/%6d tok | %5.1f%% | %6.2f tok/s | %6.1f s\n",
-                color, reset, (int) stats.n_prompt_processed, task->n_tokens(), 100.0 * f_progress,
+                color, reset, (int) stats.n_prompt_processed, (int) n_prompt_total, 100.0 * f_progress,
                 n_prompt_second, t_prompt_total / 1e3);
     }
 
@@ -1675,13 +1693,22 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache, params_base.cache_device);
+                // checkpoints beyond the common prefix are moved to the cache on save,
+                // the ones that are still valid for the new prompt stay with the slot
+                const size_t n_common = ret->prompt.tokens.get_common_prefix(task.tokens);
+                const bool need_save = n_common < ret->prompt.tokens.size();
+
+                if (need_save) {
+                    ret->prompt_save(*prompt_cache, params_base.cache_device, (int64_t) n_common);
+                }
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
                 }
 
-                prompt_cache->update();
+                if (need_save) {
+                    prompt_cache->update();
+                }
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
@@ -2490,6 +2517,39 @@ private:
         const int id_task = slot.task->id;
         const int n_response_checkpoints_max = std::min(3, params_base.n_ctx_checkpoints);
 
+        if (params_base.n_cache_after_resp > 0) {
+            const int64_t n_tokens = slot.prompt.n_tokens() - n_tokens_cur;
+            const auto it_existing = std::find_if(
+                    slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                    [&](const auto & checkpoint) {
+                        return checkpoint.n_tokens == n_tokens;
+                    });
+
+            if (it_existing != slot.prompt.checkpoints.end()) {
+                if (is_response && !it_existing->is_response) {
+                    while (std::count_if(slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(), [](const auto & checkpoint) {
+                        return checkpoint.is_response;
+                    }) >= n_response_checkpoints_max) {
+                        auto it = std::min_element(
+                                slot.prompt.checkpoints.begin(), slot.prompt.checkpoints.end(),
+                                [](const auto & a, const auto & b) {
+                                    if (a.is_response != b.is_response) {
+                                        return a.is_response;
+                                    }
+                                    return a.t_created < b.t_created;
+                                });
+                        log_checkpoint(slot, *it, "evict reason=response-cap");
+                        slot.prompt.checkpoints.erase(it);
+                    }
+                    it_existing->is_response = true;
+                }
+
+                it_existing->t_last_used = ggml_time_us();
+                log_checkpoint(slot, *it_existing, "reuse");
+                return;
+            }
+        }
+
         if (!is_response && params_base.n_cache_after_resp <= 0) {
             // Response checkpoints deliberately follow short responses, so do not evict them
             // according to the prompt checkpoint spacing policy.
@@ -2687,7 +2747,11 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                if (slot.prompt_save(*prompt_cache, params_base.cache_device)) {
+                                // if the slot is about to be cleared, move all checkpoints to the cache
+                                // otherwise keep them with the slot, its live KV cache still needs them
+                                const int64_t n_tokens_keep = params_base.kv_unified ? -1 : std::numeric_limits<int64_t>::max();
+
+                                if (slot.prompt_save(*prompt_cache, params_base.cache_device, n_tokens_keep)) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
                                 }
@@ -3638,6 +3702,11 @@ private:
 
                                             pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                             n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+
+                                            // the checkpoint restores only the non-rollbackable state (e.g. recurrent),
+                                            // cells above the restored point in the other caches are stale - drop them
+                                            slot.mem.seq_rm(slot.id, (llama_pos) n_past, -1);
+
                                             auto & checkpoint = *std::prev(it.base());
                                             checkpoint.n_hits++;
                                             checkpoint.t_last_used = ggml_time_us();
