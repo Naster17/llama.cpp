@@ -2089,6 +2089,17 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
     return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
 }
 
+int ggml_backend_sched_get_n_graph_inputs(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->n_graph_inputs;
+}
+
+ggml_tensor * ggml_backend_sched_get_graph_input(ggml_backend_sched_t sched, int i) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(i >= 0 && i < sched->n_graph_inputs);
+    return sched->graph_inputs[i];
+}
+
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {
     GGML_ASSERT(sched);
     int backend_index = ggml_backend_sched_backend_id(sched, backend);

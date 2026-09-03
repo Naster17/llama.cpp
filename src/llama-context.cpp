@@ -13,6 +13,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -1331,6 +1332,22 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// synchronize only the backends that own the graph input tensors, the other
+// backends may keep running the previous ubatch (pipeline parallelism)
+static void sync_input_backends(ggml_backend_sched_t sched) {
+    std::vector<ggml_backend_t> synced;
+    const int n_inputs = ggml_backend_sched_get_n_graph_inputs(sched);
+    for (int i = 0; i < n_inputs; i++) {
+        ggml_tensor * input = ggml_backend_sched_get_graph_input(sched, i);
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, input);
+        if (!backend || std::find(synced.begin(), synced.end(), backend) != synced.end()) {
+            continue;
+        }
+        ggml_backend_synchronize(backend);
+        synced.push_back(backend);
+    }
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
@@ -1349,10 +1366,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
-        // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading.
+        // on the GPU. we must synchronize the backends that own the input tensors before
+        // set_inputs overwrites them; the other backends keep running the previous ubatch
         if (cparams.pipeline_parallel) {
-            ggml_backend_sched_synchronize(sched.get());
+            sync_input_backends(sched.get());
         }
 
         n_reused++;

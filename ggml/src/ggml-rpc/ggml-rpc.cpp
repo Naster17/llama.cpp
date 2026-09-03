@@ -83,6 +83,31 @@ enum rpc_cmd {
 
 static_assert(RPC_CMD_HELLO == 14, "RPC_CMD_HELLO must be always 14");
 
+static const char * rpc_cmd_name(enum rpc_cmd cmd) {
+    switch (cmd) {
+        case RPC_CMD_ALLOC_BUFFER:       return "ALLOC_BUFFER";
+        case RPC_CMD_GET_ALIGNMENT:      return "GET_ALIGNMENT";
+        case RPC_CMD_GET_MAX_SIZE:       return "GET_MAX_SIZE";
+        case RPC_CMD_BUFFER_GET_BASE:    return "BUFFER_GET_BASE";
+        case RPC_CMD_FREE_BUFFER:        return "FREE_BUFFER";
+        case RPC_CMD_BUFFER_CLEAR:       return "BUFFER_CLEAR";
+        case RPC_CMD_SET_TENSOR:         return "SET_TENSOR";
+        case RPC_CMD_SET_TENSOR_HASH:    return "SET_TENSOR_HASH";
+        case RPC_CMD_GET_TENSOR:         return "GET_TENSOR";
+        case RPC_CMD_COPY_TENSOR:        return "COPY_TENSOR";
+        case RPC_CMD_GRAPH_COMPUTE:      return "GRAPH_COMPUTE";
+        case RPC_CMD_GET_DEVICE_MEMORY:  return "GET_DEVICE_MEMORY";
+        case RPC_CMD_INIT_TENSOR:        return "INIT_TENSOR";
+        case RPC_CMD_GET_ALLOC_SIZE:     return "GET_ALLOC_SIZE";
+        case RPC_CMD_HELLO:              return "HELLO";
+        case RPC_CMD_DEVICE_COUNT:       return "DEVICE_COUNT";
+        case RPC_CMD_GRAPH_RECOMPUTE:    return "GRAPH_RECOMPUTE";
+        case RPC_CMD_MEMSET_TENSOR:      return "MEMSET_TENSOR";
+        case RPC_CMD_NONE:               return "NONE";
+        default:                         return "UNKNOWN";
+    }
+};
+
 // Try RPC_CMD_SET_TENSOR_HASH first when data size is larger than this threshold
 const size_t HASH_THRESHOLD = 10 * 1024 * 1024;
 
@@ -219,6 +244,8 @@ struct ggml_backend_rpc_device_context {
     std::string name;
     std::string description;
     uint64_t    last_graph_uid;
+    uint64_t    last_graph_hash;
+    bool        last_graph_hash_valid;
 };
 
 struct ggml_backend_rpc_buffer_type_context {
@@ -561,13 +588,16 @@ void rpc_dispatcher::work() {
             break;
         }
         if (msg_ptr->cmd != RPC_CMD_NONE) {
+            uint64_t t0 = ggml_time_us();
+            bool status;
             if (msg_ptr->output) {
-                bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
-                RPC_STATUS_ASSERT(status);
+                status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size, msg_ptr->output, msg_ptr->output_size);
             } else {
-                bool status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size);
-                RPC_STATUS_ASSERT(status);
+                status = send_rpc_cmd(sock, msg_ptr->cmd, msg_ptr->input.get(), msg_ptr->input_size);
             }
+            RPC_STATUS_ASSERT(status);
+            LOG_DBG("rpc: cmd %s in %zu out %zu took %.2f ms\n",
+                    rpc_cmd_name(msg_ptr->cmd), msg_ptr->input_size, msg_ptr->output_size, (ggml_time_us() - t0) / 1000.0);
         }
         msg_ptr->completion.set_value();
     }
@@ -1018,18 +1048,28 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
     ggml_backend_rpc_device_context * rpc_dev_ctx = (ggml_backend_rpc_device_context *)rpc_dev->context;
 
     GGML_ASSERT(cgraph->n_nodes > 0);
+    // the serialization includes the remote buffer pointers, so an equal hash
+    // guarantees the graph stored on the server references the same buffers
     bool reuse = cgraph->uid != 0 && rpc_dev_ctx->last_graph_uid == cgraph->uid;
-    if (reuse) {
-        auto request = std::make_shared<rpc_msg_graph_recompute_req>();
-        request->device = rpc_ctx->device;
-        rpc_ctx->dispatcher->send_async(RPC_CMD_GRAPH_RECOMPUTE, request, sizeof(*request));
-    } else {
-        rpc_dev_ctx->last_graph_uid = cgraph->uid;
+    if (!reuse) {
         size_t input_size = 0;
         uint8_t * input = serialize_graph(rpc_ctx->device, cgraph, rpc_ctx->dispatcher, &input_size);
-        std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
-        rpc_ctx->dispatcher->send_async(RPC_CMD_GRAPH_COMPUTE, input_ptr, input_size);
+        uint64_t hash = fnv_hash(input, input_size);
+        reuse = rpc_dev_ctx->last_graph_hash_valid && rpc_dev_ctx->last_graph_hash == hash;
+        if (!reuse) {
+            rpc_dev_ctx->last_graph_hash = hash;
+            rpc_dev_ctx->last_graph_hash_valid = true;
+            rpc_dev_ctx->last_graph_uid = cgraph->uid;
+            std::shared_ptr<uint8_t> input_ptr(input, std::default_delete<uint8_t[]>());
+            rpc_ctx->dispatcher->send_async(RPC_CMD_GRAPH_COMPUTE, input_ptr, input_size);
+            return GGML_STATUS_SUCCESS;
+        }
+        delete[] input;
+        rpc_dev_ctx->last_graph_uid = cgraph->uid;
     }
+    auto request = std::make_shared<rpc_msg_graph_recompute_req>();
+    request->device = rpc_ctx->device;
+    rpc_ctx->dispatcher->send_async(RPC_CMD_GRAPH_RECOMPUTE, request, sizeof(*request));
     return GGML_STATUS_SUCCESS;
 }
 
@@ -2323,11 +2363,13 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
         std::string dev_name = "RPC" + std::to_string(dev_id);
         std::string dev_desc = std::string(endpoint);
         ggml_backend_rpc_device_context * dev_ctx = new ggml_backend_rpc_device_context {
-            /* .endpoint    = */    endpoint,
-            /* .device      = */    ind,
-            /* .name        = */    dev_name,
-            /* .description = */    dev_desc,
-            /* .last_graph_uid = */ 0,
+            /* .endpoint             = */    endpoint,
+            /* .device               = */    ind,
+            /* .name                 = */    dev_name,
+            /* .description          = */    dev_desc,
+            /* .last_graph_uid       = */ 0,
+            /* .last_graph_hash      = */ 0,
+            /* .last_graph_hash_valid = */ false,
         };
 
         ggml_backend_dev_t dev = new ggml_backend_device {
