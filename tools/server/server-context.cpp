@@ -297,6 +297,11 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // deferred host checkpoint save (P0): set by create_checkpoint, performed
+    // when the GPUs are idle so the slow state gather never blocks tokens
+    bool ckpt_pending = false;
+    bool ckpt_is_response = false;
+
     bool prompt_save(server_prompt_cache & prompt_cache, bool cache_device, int64_t n_tokens_keep) {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -368,6 +373,9 @@ struct server_slot {
 
     void prompt_clear() {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
+
+        ckpt_pending = false;
+        ckpt_is_response = false;
 
         if (!prompt.checkpoints.empty()) {
             const int64_t t_now = ggml_time_us();
@@ -1694,6 +1702,9 @@ private:
         }
 
         if (ret) {
+            // a deferred save must land before the slot is reused for a new task
+            flush_pending_checkpoint(*ret);
+
             update_cache = update_cache && prompt_cache;
 
             // cache prompts only for completion tasks
@@ -2514,6 +2525,9 @@ private:
     }
 
     void clear_checkpoints(server_slot & slot, const char * reason) {
+        slot.ckpt_pending = false;
+        slot.ckpt_is_response = false;
+
         for (const auto & checkpoint : slot.prompt.checkpoints) {
             log_checkpoint(slot, checkpoint, reason);
         }
@@ -2523,9 +2537,46 @@ private:
         SLT_TRC(slot, "ckpt: inventory count=0/%d size=0.000MiB responses=0\n", params_base.n_ctx_checkpoints);
     }
 
+    // perform a previously deferred host checkpoint save now
+    // the state is re-read live, so the save always reflects a real prefix
+    void flush_pending_checkpoint(server_slot & slot) {
+        if (!slot.ckpt_pending) {
+            return;
+        }
+        slot.ckpt_pending = false;
+
+        if (params_base.n_ctx_checkpoints <= 0 || slot.prompt.tokens.empty()) {
+            slot.ckpt_is_response = false;
+            return;
+        }
+
+        const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+        const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+        if (pos_min < 0 || pos_max < 0) {
+            slot.ckpt_is_response = false;
+            return;
+        }
+
+        const bool is_response = slot.ckpt_is_response;
+        slot.ckpt_is_response = false;
+
+        SLT_DBG(slot, "ckpt: flushing deferred save kind=%s\n", is_response ? "response" : "prompt");
+        create_checkpoint(slot, 0, pos_min, pos_max, is_response, false, false);
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool is_response = false, bool use_device = false) {
-        const int id_task = slot.task->id;
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool is_response = false, bool use_device = false, bool defer_ok = true) {
+        // host saves gather ~150 MiB layer by layer over RPC and block tokens for seconds:
+        // defer them to idle, device saves stay inline (fast, no transfer)
+        const bool want_device = params_base.cache_device && (is_response || use_device);
+        if (defer_ok && !want_device && params_base.n_ctx_checkpoints > 0) {
+            slot.ckpt_pending = true;
+            slot.ckpt_is_response = slot.ckpt_is_response || is_response;
+            SLT_DBG(slot, "ckpt: deferred kind=%s\n", is_response ? "response" : "prompt");
+            return;
+        }
+
+        const int id_task = slot.task ? slot.task->id : -1;
         const int n_response_checkpoints_max = std::min(3, params_base.n_ctx_checkpoints);
 
         if (params_base.n_cache_after_resp > 0) {
@@ -2770,6 +2821,8 @@ private:
                         for (auto & slot : slots) {
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
+
+                                flush_pending_checkpoint(slot);
 
                                 // if the slot is about to be cleared, move all checkpoints to the cache
                                 // otherwise keep them with the slot, its live KV cache still needs them
@@ -3156,6 +3209,12 @@ private:
                 SRV_TRC("%s", "all slots are idle\n");
 
                 metrics_flush_idle();
+
+                // GPUs are free: perform deferred checkpoint saves here so they
+                // never block tokens (client think time covers the slow gather)
+                for (auto & slot : slots) {
+                    flush_pending_checkpoint(slot);
+                }
 
                 return; // skip further processing
 
@@ -3691,6 +3750,9 @@ private:
                                 }
 
                                 if (pos_min >= pos_min_thold) {
+                                    // a not-yet-saved checkpoint must materialize before search
+                                    flush_pending_checkpoint(slot);
+
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),

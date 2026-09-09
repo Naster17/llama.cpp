@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <atomic>
 #include <thread>
+#include <chrono>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
 
@@ -607,8 +608,13 @@ void rpc_dispatcher::start(const std::string & endpoint) {
     }
 
     sock = socket_t::connect(host.c_str(), port);
+    for (int attempt = 1; sock == nullptr && attempt < 10; ++attempt) {
+        GGML_LOG_WARN("Failed to connect to %s, retrying (%d/9)...\n", endpoint.c_str(), attempt);
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        sock = socket_t::connect(host.c_str(), port);
+    }
     if (sock == nullptr) {
-        GGML_ABORT("Failed to connect to %s\n", endpoint.c_str());
+        GGML_ABORT("Failed to connect to %s after 10 attempts\n", endpoint.c_str());
     }
     if (!negotiate_hello(sock)) {
         GGML_ABORT("RPC handshake failed for %s\n", endpoint.c_str());
